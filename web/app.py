@@ -15,16 +15,19 @@ try:
     from .models import Catalog, Heartbeat, Job
     from .protocol import parse_arguments
     from .store import MemoryStore
+    from .agent import register_agent_routes
 except ImportError:  # Render runs `uvicorn app:app` from web/
     from models import Catalog, Heartbeat, Job
     from protocol import parse_arguments
     from store import MemoryStore
+    from agent import register_agent_routes
 
 app = FastAPI(title="MCP-WEB", version="0.1.0")
 store = MemoryStore()
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 READ_WAIT_SECONDS = 8.0
+register_agent_routes(app, store, lambda: current_studio_connected())
 
 
 def no_cache(response: JSONResponse) -> JSONResponse:
@@ -201,4 +204,4 @@ async def state(state_key: str) -> JSONResponse:
 
 @app.get("/api/v1/dashboard.json")
 async def dashboard_data() -> JSONResponse:
-    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
+    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})

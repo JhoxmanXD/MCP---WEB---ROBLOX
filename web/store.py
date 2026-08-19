@@ -23,6 +23,8 @@ class MemoryStore:
         self.latest: dict[str, Any] | None = None
         self.states: dict[str, Any] = {}
         self.heartbeat: Heartbeat | None = None
+        self.drafts: dict[str, dict[str, Any]] = {}
+        self.recent_refs: list[dict[str, Any]] = []
 
     def create_job(self, job: Job) -> Job:
         with self.lock:

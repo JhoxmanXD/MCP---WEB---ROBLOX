@@ -1,3 +1,5 @@
+import re
+
 from fastapi.testclient import TestClient
 
 from web.app import app, store
@@ -95,3 +97,29 @@ def test_read_result_does_not_create_job():
     response = client.get("/read/result/UNKNOWN_READ_ID")
     assert response.status_code == 200
     assert len(store.jobs) == before
+
+
+def test_agent_gateway_draft_prepare_and_one_shot_execute():
+    store.catalog.tools = [{"name": "test_tool", "description": "test", "inputSchema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}]
+    store.catalog.tool_count = 1
+    home = client.get("/agent")
+    assert home.status_code == 200 and "/agent/tools" in home.text
+    assert client.get("/agent/tools").status_code == 200
+    assert client.get("/agent/tool/test_tool").status_code == 200
+    started = client.get("/agent/tool/test_tool/start", follow_redirects=False)
+    assert started.status_code == 303
+    draft_url = started.headers["location"]
+    draft = client.get(draft_url)
+    assert "Missing required: enabled" in draft.text
+    draft_id = draft_url.rsplit("/", 1)[-1]
+    set_value = client.get(f"/agent/draft/{draft_id}/arg/enabled/set/true", follow_redirects=False)
+    assert set_value.status_code == 303
+    prepared = client.get(f"/agent/draft/{draft_id}/prepare", follow_redirects=False)
+    assert prepared.status_code == 200
+    execute_link = re.search(r"/agent/execute/[^']+", prepared.text).group(0)
+    executed = client.get(execute_link, follow_redirects=False)
+    assert executed.status_code == 303
+    request_id = executed.headers["location"].rsplit("/", 1)[-1]
+    repeat = client.get(execute_link, follow_redirects=False)
+    assert repeat.headers["location"].endswith(request_id)
+    assert len([job for job in store.jobs.values() if job.request_id == request_id]) == 1

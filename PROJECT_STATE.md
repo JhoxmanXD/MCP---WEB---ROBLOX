@@ -11,6 +11,7 @@
 - `config.json` actualizado al deploy real `https://mcp-web-roblox.onrender.com`.
 - `run_relay.bat` comprueba el puerto MCP 8787 y arranca el bridge existente si hace falta.
 - El heartbeat devuelve `catalog_present` y `catalog_tool_count`; el cliente republica el catálogo solo cuando falta o está incompleto.
+- Agent Gateway navegable añadido localmente: tools dinámicas, drafts, wizard primitivo, prepare/execute one-shot, resultados y documentación de uso.
 
 ## TESTED
 
@@ -20,6 +21,7 @@
 - Render real: `/api/v1/health.json` HTTP 200 y `/` HTTP 200.
 - Render recibió heartbeat: `local_client_online=true`, `mcp_connected=true`, `studio_connected=true`, `tool_count=71`.
 - Tests de recuperación de catálogo: catálogo existente no se reenvía; catálogo ausente se restaura; fallo temporal no termina el cliente.
+- Suite actual: 17 tests pasan.
 - Catálogo público: 71 tools e incluye `studio_list_sessions`.
 
 ## REAL MCP TEST
@@ -37,6 +39,7 @@
 
 - Desplegar `web/` en Render y sustituir `REPLACE-ME`.
 - Prueba E2E pública con un job de lectura.
+- Deploy manual del commit de trabajo actual para publicar `/agent/*`.
 
 ## KNOWN LIMITATIONS
 
