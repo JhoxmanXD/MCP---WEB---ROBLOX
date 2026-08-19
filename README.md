@@ -16,10 +16,10 @@ python -m venv .venv
 pip install -r requirements-local.txt
 ```
 
-Edita `config.json` y coloca la URL de Render en `relay_url`. Deben estar abiertos Roblox Studio, el proyecto, el bridge MCP existente y el cliente local. El bridge HTTP local debe estar iniciado con:
+`config.json` ya está preparado para el deploy actual `https://mcp-web-roblox.onrender.com`. Deben estar abiertos Roblox Studio y el proyecto. `run_relay.bat` comprueba el MCP HTTP local y arranca el bridge existente si no está escuchando:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:\Users\jhoxm\OneDrive\Documentos\Roblox\tools\roblox-studio-mcp-bridge\scripts\start.ps1" -Transport streamable-http -Background
+run_relay.bat
 ```
 
 Después ejecuta `run_relay.bat` o `python -m local.relay_client`.

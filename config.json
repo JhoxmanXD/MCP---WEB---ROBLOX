@@ -1,5 +1,5 @@
 {
-  "relay_url": "https://REPLACE-ME.onrender.com",
+  "relay_url": "https://mcp-web-roblox.onrender.com",
   "poll_interval_seconds": 1.0,
   "client_name": "jhoxman-pc",
   "mcp_url": "http://127.0.0.1:8787/mcp"
