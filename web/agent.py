@@ -29,14 +29,14 @@ def now() -> str:
 def schema_type(schema: dict[str, Any]) -> str:
     if isinstance(schema.get("type"), str):
         return schema["type"]
-    for option in schema.get("anyOf", []):
+    for option in schema.get("anyOf", []) + schema.get("oneOf", []):
         if option.get("type") not in {"null", None}:
             return option.get("type", "value")
     return "value"
 
 
 def nullable(schema: dict[str, Any]) -> bool:
-    return any(option.get("type") == "null" for option in schema.get("anyOf", [])) or schema.get("type") == "null"
+    return any(option.get("type") == "null" for option in schema.get("anyOf", []) + schema.get("oneOf", [])) or schema.get("type") == "null"
 
 
 def href(path: str, label: str) -> str:
@@ -60,6 +60,12 @@ def agent_page(title: str, body: str) -> HTMLResponse:
     return response
 
 
+def agent_redirect(path: str, status_code: int = 303) -> RedirectResponse:
+    response = RedirectResponse(path, status_code=status_code)
+    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "CDN-Cache-Control": "no-store", "Surrogate-Control": "no-store"})
+    return response
+
+
 def register_agent_routes(app, store, current_studio_connected):
     DRAFT_TTL_SECONDS = 3600
 
@@ -69,6 +75,10 @@ def register_agent_routes(app, store, current_studio_connected):
             try:
                 if datetime.fromisoformat(draft.get("last_access", draft["created_at"])).timestamp() < cutoff:
                     del store.drafts[draft_id]
+                    for collection in (store.views, store.actions, store.prepared, store.result_views, store.editors):
+                        for item_id, item in list(collection.items()):
+                            if item.get("draft_id") == draft_id:
+                                del collection[item_id]
             except (KeyError, ValueError):
                 del store.drafts[draft_id]
 
@@ -112,6 +122,8 @@ def register_agent_routes(app, store, current_studio_connected):
             "tool_name": draft["tool_name"],
             "schema": copy.deepcopy(draft["schema"]),
             "action_ids": {},
+            "recent_string_values": copy.deepcopy(store.recent_string_values),
+            "recent_refs": copy.deepcopy(store.recent_refs[-100:]),
         }
         store.views[view_id] = snapshot
         return view_id
@@ -142,20 +154,157 @@ def register_agent_routes(app, store, current_studio_connected):
             view["action_ids"][key] = action_id
         return href(f"/agent/action/{action_id}", label)
 
+    def path_get(value: Any, path: list[Any]) -> Any:
+        current = value
+        for part in path:
+            current = current[part]
+        return current
+
+    def path_set(value: Any, path: list[Any], replacement: Any) -> None:
+        if not path:
+            raise ValueError("empty path")
+        current = value
+        for part in path[:-1]:
+            if isinstance(current, list):
+                current = current[int(part)]
+            else:
+                if part not in current or not isinstance(current[part], (dict, list)):
+                    current[part] = {}
+                current = current[part]
+        last = path[-1]
+        if isinstance(current, list):
+            current[int(last)] = replacement
+        else:
+            current[last] = replacement
+
+    def path_delete(value: Any, path: list[Any]) -> None:
+        if not path:
+            return
+        current = path_get(value, path[:-1]) if len(path) > 1 else value
+        last = path[-1]
+        if isinstance(current, list):
+            current.pop(int(last))
+        elif isinstance(current, dict):
+            current.pop(last, None)
+
+    def infer_schema(value: Any) -> dict[str, Any]:
+        if isinstance(value, bool): return {"type": "boolean"}
+        if isinstance(value, int) and not isinstance(value, bool): return {"type": "integer"}
+        if isinstance(value, float): return {"type": "number"}
+        if isinstance(value, str): return {"type": "string"}
+        if isinstance(value, list): return {"type": "array", "items": infer_schema(value[0]) if value else {"type": "string"}}
+        if isinstance(value, dict): return {"type": "object", "additionalProperties": True}
+        if value is None: return {"type": ["null", "string"]}
+        return {"type": "string"}
+
+    def default_for_schema(schema: dict[str, Any]) -> Any:
+        if "default" in schema: return copy.deepcopy(schema["default"])
+        typ = schema_type(schema)
+        if typ == "object": return {}
+        if typ == "array": return []
+        if typ == "boolean": return False
+        if typ in {"integer", "number"}: return 0
+        if typ == "string": return ""
+        return None
+
+    def selector_schema(name: str, schema: dict[str, Any]) -> bool:
+        return name.lower() in {"ref", "parent", "target", "instance", "selection", "script"}
+
+    def create_editor(view: dict[str, Any], path: list[Any], kind: str = "value", schema: dict[str, Any] | None = None) -> str:
+        editor_id = "E_" + uuid4().hex[:18]
+        editor_schema = copy.deepcopy(schema or {})
+        if path:
+            try:
+                value = copy.deepcopy(path_get(view["arguments_snapshot"], path))
+            except (KeyError, IndexError, TypeError):
+                value = default_for_schema(editor_schema)
+        else:
+            value = copy.deepcopy(view["arguments_snapshot"])
+        store.editors[editor_id] = {"editor_id": editor_id, "view_id": view["view_id"], "draft_id": view["draft_id"], "revision": view["revision"], "path": copy.deepcopy(path), "kind": kind, "schema": editor_schema or infer_schema(value), "value_snapshot": value, "action_ids": {}}
+        return f"/agent/editor/{editor_id}"
+
+    def create_key_editor(view: dict[str, Any], parent_path: list[Any]) -> str:
+        editor_id = "E_" + uuid4().hex[:18]
+        store.editors[editor_id] = {"editor_id": editor_id, "view_id": view["view_id"], "draft_id": view["draft_id"], "revision": view["revision"], "path": copy.deepcopy(parent_path), "kind": "key", "schema": {"type": "string"}, "value_snapshot": "", "action_ids": {}}
+        return f"/agent/editor/{editor_id}"
+
+    def editor_action_link(editor: dict[str, Any], operation: str, payload: dict[str, Any], label: str) -> str:
+        key = json.dumps([operation, payload], ensure_ascii=False, sort_keys=True, default=str)
+        action_id = editor["action_ids"].get(key)
+        if not action_id:
+            action_id = "A_" + uuid4().hex[:18]
+            store.actions[action_id] = {"action_id": action_id, "draft_id": editor["draft_id"], "expected_revision": editor["revision"], "operation": operation, "payload": {"editor_id": editor["editor_id"], **copy.deepcopy(payload)}, "created_at": now(), "consumed": False, "resulting_url": None}
+            editor["action_ids"][key] = action_id
+        return href(f"/agent/action/{action_id}", label)
+
+    def editor_back(editor: dict[str, Any]) -> str:
+        return href(f"/agent/view/{editor['view_id']}", "Back to Draft")
+
+    def render_editor(editor: dict[str, Any]) -> HTMLResponse:
+        value = editor["value_snapshot"]; schema = editor["schema"]; kind = editor["kind"]
+        actions: list[str] = []
+        if kind == "key":
+            for token, char in STRING_CHARACTERS:
+                actions.append(editor_action_link(editor, "editor_append_key", {"character": char}, f"Append {char if char != ' ' else 'space'}"))
+            actions += [editor_action_link(editor, "editor_backspace_key", {}, "Backspace"), editor_action_link(editor, "editor_clear_key", {}, "Clear"), editor_action_link(editor, "editor_finish_key", {}, "Finish"), editor_back(editor)]
+            body = f"<h1>Object Key Composer</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>CURRENT KEY: <code>{escape(str(value))}</code></p><p>{' '.join(actions)}</p>"
+            return agent_page("Object Key Composer", body)
+        typ = schema_type(schema)
+        if typ == "object":
+            items = []
+            properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
+            for key, item in value.items() if isinstance(value, dict) else []:
+                item_schema = properties.get(key) or (schema.get("additionalProperties") if isinstance(schema.get("additionalProperties"), dict) else None)
+                item_schema = item_schema or infer_schema(item)
+                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [key], "kind": schema_type(item_schema), "schema": item_schema}, f"Edit {key}")
+                remove = editor_action_link(editor, "editor_remove_key", {"key": key}, f"Remove {key}")
+                items.append(f"<li><strong>{escape(str(key))}</strong>: <code>{escape(str(item))}</code> {edit} {remove}</li>")
+            add = editor_action_link(editor, "editor_open_key", {}, "Add field")
+            clear = editor_action_link(editor, "editor_clear_container", {}, "Clear object")
+            body = f"<h1>Object Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><pre>{escape(json.dumps(value, ensure_ascii=False, indent=2))}</pre><ul>{''.join(items) or '<li>No fields</li>'}</ul><p>{add} {clear} {editor_back(editor)}</p>"
+            return agent_page("Object Editor", body)
+        if typ == "array":
+            items = []
+            item_schema = schema.get("items", {}) if isinstance(schema.get("items"), dict) else {}
+            for index, item in enumerate(value if isinstance(value, list) else []):
+                actual_schema = item_schema if item_schema and schema_type(item_schema) != "value" else infer_schema(item)
+                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [index], "kind": schema_type(actual_schema), "schema": actual_schema}, f"Edit item {index}")
+                remove = editor_action_link(editor, "editor_remove_item", {"index": index}, f"Remove item {index}")
+                items.append(f"<li><code>{escape(str(item))}</code> {edit} {remove}</li>")
+            add = editor_action_link(editor, "editor_add_item", {"value": default_for_schema(item_schema)}, "Add item")
+            links = [add, editor_action_link(editor, "editor_remove_last", {}, "Remove last"), editor_action_link(editor, "editor_clear_container", {}, "Clear"), editor_back(editor)]
+            body = f"<h1>Array Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><pre>{escape(json.dumps(value, ensure_ascii=False, indent=2))}</pre><ol>{''.join(items) or '<li>Empty array</li>'}</ol><p>{' '.join(links)}</p>"
+            return agent_page("Array Editor", body)
+        if "enum" in schema:
+            actions += [editor_action_link(editor, "editor_set_value", {"value": item}, f"Set {item}") for item in schema["enum"]]
+        elif typ == "boolean":
+            actions += [editor_action_link(editor, "editor_set_value", {"value": True}, "Set true"), editor_action_link(editor, "editor_set_value", {"value": False}, "Set false")]
+        elif typ in {"integer", "number"}:
+            for token in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "."]:
+                actions.append(editor_action_link(editor, "editor_append_number", {"token": token}, token))
+            actions += [editor_action_link(editor, "editor_backspace", {}, "Backspace"), editor_action_link(editor, "editor_clear_scalar", {}, "Clear"), editor_action_link(editor, "editor_finish_number", {}, "Finish")]
+        elif typ == "string":
+            for token, char in STRING_CHARACTERS:
+                actions.append(editor_action_link(editor, "editor_append_string", {"character": char}, f"Append {char if char != ' ' else 'space'}"))
+            actions += [editor_action_link(editor, "editor_backspace", {}, "Backspace"), editor_action_link(editor, "editor_clear_scalar", {}, "Clear"), editor_action_link(editor, "editor_finish_scalar", {}, "Finish")]
+        elif typ == "value":
+            actions += [editor_action_link(editor, "editor_initialize_value", {"value_type": "string"}, "Edit as string"), editor_action_link(editor, "editor_initialize_value", {"value_type": "number"}, "Edit as number"), editor_action_link(editor, "editor_initialize_value", {"value_type": "boolean"}, "Edit as boolean"), editor_action_link(editor, "editor_initialize_value", {"value_type": "object"}, "Edit as object"), editor_action_link(editor, "editor_initialize_value", {"value_type": "array"}, "Edit as array"), editor_action_link(editor, "editor_set_value", {"value": None}, "Set null")]
+        body = f"<h1>Value Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>TYPE: {escape(typ)}</p><p>CURRENT VALUE: <code>{escape(str(value))}</code></p><p>{' '.join(actions)} {editor_back(editor)}</p>"
+        return agent_page("Value Editor", body)
+
     def stale_page(action: dict[str, Any], draft: dict[str, Any]) -> HTMLResponse:
         current = create_agent_view(draft)
         body = f"<h1>STALE DRAFT VIEW</h1><p>Expected revision: {action['expected_revision']}</p><p>Current revision: {draft.get('revision', 0)}</p><p>This action belongs to an older draft view and was NOT applied.</p><p>{href('/agent/view/' + current, 'Open Current Draft')}</p>"
         return agent_page("Stale Draft View", body)
 
     def snapshot_links(view: dict[str, Any], name: str, schema: dict[str, Any]) -> str:
-        draft_id = view["draft_id"]; revision = view["revision"]; encoded = quote(name, safe="")
         links: list[str] = []
         base = {"name": name}
         if "enum" in schema:
             links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in schema["enum"]]
         typ = schema_type(schema)
         if typ == "string":
-            values = [schema.get("default"), "Workspace", "Part", "Folder", "Model", "Script", "Name", "Parent"] + list(reversed(store.recent_string_values))
+            values = [schema.get("default"), "Workspace", "Part", "Folder", "Model", "Script", "Name", "Parent"] + list(reversed(view.get("recent_string_values", [])))
             links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in values if value is not None]
             links.append(view_action_link(view, "open_string", {"name": name, "view_id": view["view_id"]}, f"Open String Composer ({name})"))
         elif typ == "boolean":
@@ -163,11 +312,15 @@ def register_agent_routes(app, store, current_studio_connected):
         elif typ in {"integer", "number"}:
             values = [0, 1, -1, 10, 100, 0.5] if typ == "number" else [0, 1, -1, 10, 100]
             links += [view_action_link(view, "set_arg", {**base, "value": value}, str(value)) for value in values]
-        elif typ == "object" and name in {"values", "properties", "attributes"}:
-            links.append(view_action_link(view, "set_nested", {"name": name, "path": ["Anchored"], "value": True}, "Set Anchored=true"))
+        elif typ == "object":
+            links.append(view_action_link(view, "open_editor", {"view_id": view["view_id"], "path": [name], "kind": "object", "schema": schema}, "Edit object"))
+            if name in {"values", "properties", "attributes"}:
+                links.append(view_action_link(view, "set_nested", {"name": name, "path": ["Anchored"], "value": True}, "Set Anchored=true"))
         elif typ == "array" and name == "names":
             links.append(view_action_link(view, "set_arg", {"name": name, "value": ["Anchored"]}, "Read Anchored"))
-        if name.lower() in {"ref", "parent", "target", "instance", "selection", "script", "object"} or typ == "object":
+        elif typ == "array":
+            links.append(view_action_link(view, "open_editor", {"view_id": view["view_id"], "path": [name], "kind": "array", "schema": schema}, "Edit array"))
+        if selector_schema(name, schema):
             links.append(view_action_link(view, "open_picker", {"name": name, "view_id": view["view_id"]}, "Choose Roblox Instance"))
         if nullable(schema):
             links.append(view_action_link(view, "set_arg", {**base, "value": None}, "Set null"))
@@ -287,7 +440,7 @@ def register_agent_routes(app, store, current_studio_connected):
         draft_id = "d_" + uuid4().hex[:16]
         store.drafts[draft_id] = {"draft_id": draft_id, "revision": 0, "tool_name": tool_name, "schema": tool.get("inputSchema", {}), "arguments": {}, "created_at": now(), "last_access": now(), "status": "draft", "executed": False, "request_id": None, "execution_token": None}
         view_id = create_agent_view(store.drafts[draft_id])
-        return RedirectResponse(f"/agent/view/{view_id}", status_code=303)
+        return agent_redirect(f"/agent/view/{view_id}")
 
     @app.get("/agent/view/{view_id}", response_class=HTMLResponse)
     async def agent_view(view_id: str):
@@ -299,7 +452,7 @@ def register_agent_routes(app, store, current_studio_connected):
         for name, schema in view["schema"].get("properties", {}).items():
             value = view["arguments_snapshot"].get(name, "<missing>")
             fields.append(f"<div class='card'><strong>{escape(name)}</strong> ({escape(schema_type(schema))})<br>value: <code>{escape(str(value))}</code><br>{snapshot_links(view, name, schema)}</div>")
-        prepare = action_link(view["draft_id"], view["revision"], "prepare", {}, "Prepare Execution") if view["ready"] else "Complete required arguments first"
+        prepare = view_action_link(view, "prepare", {}, "Prepare Execution") if view["ready"] else "Complete required arguments first"
         body = f"<h1>Invocation View</h1><p>VIEW_ID: <code>{escape(view_id)}</code></p><p>DRAFT_ID: <code>{escape(view['draft_id'])}</code></p><p>DRAFT_REVISION: {view['revision']}</p><p>STATE: {escape('ready' if view['ready'] else 'draft')}</p><p>TOOL: {escape(view['tool_name'])}</p><p class='missing'>Missing required: {escape(', '.join(view['missing_arguments']) or 'none')}</p>{''.join(fields)}<h2>Arguments snapshot</h2><pre>{escape(json.dumps(view['arguments_snapshot'], ensure_ascii=False, indent=2))}</pre><p>{prepare} {href('/agent/tools', 'Tools')} {href('/agent', 'Agent Home')}</p>"
         return agent_page("Invocation View", body)
 
@@ -310,7 +463,7 @@ def register_agent_routes(app, store, current_studio_connected):
             raise HTTPException(404, "Action not found or expired")
         if action.get("consumed"):
             target = action.get("resulting_url")
-            return RedirectResponse(target, status_code=303) if target else agent_page("Action complete", "<h1>Action already consumed</h1>")
+            return agent_redirect(target) if target else agent_page("Action complete", "<h1>Action already consumed</h1>")
         draft = draft_or_404(action["draft_id"])
         if action["operation"] not in {"execute_prepared", "refresh_result"} and int(action["expected_revision"]) != int(draft.get("revision", 0)):
             return stale_page(action, draft)
@@ -321,6 +474,120 @@ def register_agent_routes(app, store, current_studio_connected):
         elif operation == "open_picker":
             view_id = payload.get("view_id") or create_agent_view(draft)
             target = f"/agent/picker-view/{view_id}/{quote(payload['name'], safe='')}"
+        elif operation == "open_editor":
+            source_view = store.views.get(payload.get("view_id"))
+            if not source_view:
+                raise HTTPException(404, "Source view not found")
+            target = create_editor(source_view, list(payload["path"]), payload.get("kind", "value"), payload.get("schema"))
+        elif operation == "editor_open_key":
+            editor = store.editors.get(payload.get("editor_id"))
+            if not editor:
+                raise HTTPException(404, "Editor not found")
+            source_view = store.views.get(editor["view_id"])
+            target = create_key_editor(source_view, editor["path"])
+        elif operation in {"editor_append_key", "editor_backspace_key", "editor_clear_key"}:
+            editor = store.editors.get(payload.get("editor_id"))
+            if not editor:
+                raise HTTPException(404, "Editor not found")
+            value = str(editor["value_snapshot"])
+            if operation == "editor_append_key": value += payload["character"]
+            elif operation == "editor_backspace_key": value = value[:-1]
+            else: value = ""
+            cloned_view = store.views.get(editor["view_id"])
+            target = create_key_editor(cloned_view, editor["path"])
+            new_editor_id = target.rsplit("/", 1)[-1]
+            store.editors[new_editor_id]["value_snapshot"] = value
+        elif operation == "editor_finish_key":
+            editor = store.editors.get(payload.get("editor_id"))
+            if not editor:
+                raise HTTPException(404, "Editor not found")
+            key = str(editor["value_snapshot"])
+            if not key:
+                target = create_editor(store.views[editor["view_id"]], editor["path"], "object")
+            else:
+                path_set(draft["arguments"], editor["path"] + [key], None)
+                bump(draft)
+                next_view = create_agent_view(draft)
+                target = create_editor(store.views[next_view], editor["path"], "object")
+        elif operation == "editor_initialize_value":
+            editor = store.editors.get(payload.get("editor_id"))
+            if not editor:
+                raise HTTPException(404, "Editor not found")
+            value_type = payload.get("value_type")
+            if value_type not in {"string", "number", "integer", "boolean", "object", "array"}:
+                raise HTTPException(400, "Unsupported value type")
+            defaults = {"string": "", "number": 0, "integer": 0, "boolean": False, "object": {}, "array": []}
+            path_set(draft["arguments"], editor["path"], defaults[value_type])
+            bump(draft)
+            next_view = create_agent_view(draft)
+            target = create_editor(store.views[next_view], editor["path"], value_type, {"type": value_type, "items": {"type": "object"}} if value_type == "array" else {"type": value_type, "additionalProperties": True} if value_type == "object" else {"type": value_type})
+        elif operation.startswith("editor_"):
+            editor = store.editors.get(payload.get("editor_id"))
+            if not editor:
+                raise HTTPException(404, "Editor not found")
+            path = list(editor["path"])
+            if path:
+                try:
+                    value = path_get(draft["arguments"], path)
+                except (KeyError, IndexError, TypeError):
+                    value = default_for_schema(editor["schema"])
+                    path_set(draft["arguments"], path, value)
+            else:
+                value = draft["arguments"]
+            typ = schema_type(editor["schema"])
+            mutated = True
+            if operation == "editor_set_value":
+                path_set(draft["arguments"], path, copy.deepcopy(payload.get("value")))
+            elif operation == "editor_append_string":
+                path_set(draft["arguments"], path, str(value) + payload["character"])
+            elif operation == "editor_append_number":
+                path_set(draft["arguments"], path, str(value) + payload["token"])
+            elif operation == "editor_backspace":
+                path_set(draft["arguments"], path, str(value)[:-1])
+            elif operation == "editor_clear_scalar":
+                path_set(draft["arguments"], path, "")
+            elif operation == "editor_finish_scalar":
+                path_set(draft["arguments"], path, str(value))
+            elif operation == "editor_finish_number":
+                raw = str(value)
+                try:
+                    parsed = float(raw) if "." in raw else int(raw)
+                except ValueError as exc:
+                    raise HTTPException(400, "Enter a valid number before finishing") from exc
+                minimum = editor["schema"].get("minimum")
+                maximum = editor["schema"].get("maximum")
+                if minimum is not None and parsed < minimum:
+                    raise HTTPException(400, f"Value must be at least {minimum}")
+                if maximum is not None and parsed > maximum:
+                    raise HTTPException(400, f"Value must be at most {maximum}")
+                path_set(draft["arguments"], path, parsed)
+            elif operation == "editor_add_item":
+                if not isinstance(value, list): raise HTTPException(400, "Editor value is not an array")
+                value.append(copy.deepcopy(payload.get("value")))
+            elif operation == "editor_remove_item":
+                path_delete(draft["arguments"], path + [int(payload["index"])])
+            elif operation == "editor_remove_last":
+                if isinstance(value, list) and value: value.pop()
+            elif operation == "editor_remove_key":
+                path_delete(draft["arguments"], path + [payload["key"]])
+            elif operation == "editor_clear_container":
+                path_set(draft["arguments"], path, [] if typ == "array" else {})
+            else:
+                mutated = False
+            if not mutated:
+                raise HTTPException(400, "Unknown editor action")
+            bump(draft)
+            next_view = create_agent_view(draft)
+            if operation in {"editor_append_string", "editor_append_number", "editor_backspace", "editor_clear_scalar"}:
+                target = create_editor(store.views[next_view], path, editor["kind"], editor["schema"])
+            elif operation in {"editor_add_item", "editor_remove_item", "editor_remove_last", "editor_remove_key", "editor_clear_container"}:
+                target = create_editor(store.views[next_view], path, editor["kind"], editor["schema"])
+            elif len(path) > 1:
+                parent_path = path[:-1]
+                parent_value = path_get(store.views[next_view]["arguments_snapshot"], parent_path)
+                target = create_editor(store.views[next_view], parent_path, "array" if isinstance(parent_value, list) else "object")
+            else:
+                target = f"/agent/view/{next_view}"
         elif operation == "prepare":
             arguments = copy.deepcopy(draft["arguments"])
             canonical = json.dumps({"tool_name": draft["tool_name"], "arguments": arguments}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -374,7 +641,7 @@ def register_agent_routes(app, store, current_studio_connected):
             else:
                 target = f"/agent/view/{next_view}"
         action["consumed"] = True; action["resulting_url"] = target
-        return RedirectResponse(target, status_code=303)
+        return agent_redirect(target)
 
     @app.get("/agent/string-view/{view_id}/{name}", response_class=HTMLResponse)
     async def string_view(view_id: str, name: str):
@@ -393,13 +660,20 @@ def register_agent_routes(app, store, current_studio_connected):
         if not view:
             raise HTTPException(404, "Picker view not found")
         items = []
-        for candidate in store.recent_refs[-50:]:
+        for candidate in view.get("recent_refs", [])[-50:]:
             candidate_url = view_action_link(view, "select_instance", {"name": name, "candidate": candidate}, "__candidate__")
             label = str(candidate.get("name", candidate.get("ref", "candidate")))
             if candidate.get("className"): label += f" ({candidate['className']})"
             items.append(f"<li>{candidate_url.replace('>__candidate__</a>', '>' + escape(label) + '</a>')} — {escape(str(candidate.get('displayPath', candidate.get('ref', ''))))}</li>")
         body = f"<h1>Roblox Instance Picker</h1><p>VIEW_ID: <code>{escape(view_id)}</code></p><p>DRAFT_ID: <code>{escape(view['draft_id'])}</code></p><p>DRAFT_REVISION: {view['revision']}</p><ul>{''.join(items) or '<li>No recent references yet. Run a read recipe first.</li>'}</ul>{href('/agent/view/' + view_id, 'Back to Draft')}"
         return agent_page("Roblox Instance Picker", body)
+
+    @app.get("/agent/editor/{editor_id}", response_class=HTMLResponse)
+    async def editor_view(editor_id: str):
+        editor = store.editors.get(editor_id)
+        if not editor:
+            raise HTTPException(404, "Editor not found or expired")
+        return render_editor(editor)
 
     @app.get("/agent/prepared/{prepare_id}", response_class=HTMLResponse)
     async def prepared_view(prepare_id: str):

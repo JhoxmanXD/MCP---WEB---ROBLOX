@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -24,7 +25,6 @@ class StreamableHTTPMCP:
 
     async def close(self) -> None:
         await self.stack.aclose()
-
     async def list_tools(self) -> list[dict[str, Any]]:
         result = await self.session.list_tools()
         return [jsonable(tool) for tool in result.tools]
@@ -53,6 +53,15 @@ class StreamableHTTPMCP:
         return False
 
 
+async def safe_close(adapter: StreamableHTTPMCP | None) -> None:
+    if adapter is None:
+        return
+    try:
+        await adapter.close()
+    except Exception as exc:
+        logging.getLogger("mcp-web").warning("[MCP] Cleanup failed; continuing reconnect: %s", exc)
+
+
 async def connect_with_backoff(url: str, attempts: int = 3) -> StreamableHTTPMCP:
     last: Exception | None = None
     for attempt in range(attempts):
@@ -62,6 +71,6 @@ async def connect_with_backoff(url: str, attempts: int = 3) -> StreamableHTTPMCP
             return adapter
         except Exception as exc:
             last = exc
-            await adapter.close()
+            await safe_close(adapter)
             await asyncio.sleep(min(2 ** attempt, 8))
     raise RuntimeError(f"MCP connection failed: {last}")

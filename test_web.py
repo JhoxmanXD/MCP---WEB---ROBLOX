@@ -10,7 +10,7 @@ client = TestClient(app)
 
 def setup_function():
     store.jobs.clear(); store.queue.clear(); store.states.clear(); store.latest = None
-    store.recent_refs.clear(); store.recent_string_values.clear(); store.drafts.clear(); store.views.clear(); store.actions.clear(); store.prepared.clear(); store.result_views.clear()
+    store.recent_refs.clear(); store.recent_string_values.clear(); store.drafts.clear(); store.views.clear(); store.actions.clear(); store.prepared.clear(); store.result_views.clear(); store.editors.clear()
     store.catalog.tools = [{"name": "read_tool", "description": "read", "inputSchema": {}}]
     store.catalog.tool_count = 1
 
@@ -246,6 +246,103 @@ def test_build_markers_are_visible_on_agent_and_health():
     assert "AGENT_PROTOCOL_VERSION:" in agent_status.text
     health = client.get("/api/v1/health.json").json()
     assert health["agent_protocol_version"] == "immutable-v1"
+
+
+def test_immutable_redirects_have_strong_no_cache_headers():
+    store.catalog.tools = [{"name": "redirect_tool", "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/redirect_tool")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    assert started.status_code == 303 and "/agent/view/V_" in started.headers["location"]
+    for header, expected in [("cache-control", "no-store"), ("pragma", "no-cache"), ("expires", "0"), ("cdn-cache-control", "no-store"), ("surrogate-control", "no-store")]:
+        assert expected in started.headers[header].lower()
+    view = client.get(started.headers["location"])
+    action = client.get(_link(view.text, "Open String Composer (value)"), follow_redirects=False)
+    assert action.status_code == 303 and "/agent/string-view/V_" in action.headers["location"]
+    assert "no-store" in action.headers["cache-control"]
+
+
+def test_view_freezes_prepare_and_recent_string_action_links():
+    store.catalog.tools = [{"name": "stable_tool", "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}}]
+    store.catalog.tool_count = 1
+    store.recent_string_values[:] = ["OldRecent"]
+    page = _start_string_draft()
+    page = client.get(_link(page.text, "Open String Composer (name)"))
+    first = page.text
+    store.recent_string_values[:] = ["NewRecent"]
+    assert client.get(page.request.url).text == first
+
+
+def test_picker_view_freezes_candidates():
+    store.catalog.tools = [{"name": "picker_tool", "inputSchema": {"type": "object", "properties": {"parent": {"type": "object", "additionalProperties": True}}}}]
+    store.catalog.tool_count = 1
+    store.recent_refs[:] = [{"ref": "rbx:one", "name": "One", "className": "Folder", "path": ["p", "One"]}]
+    tool_page = client.get("/agent/tool/picker_tool")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    page = client.get(started.headers["location"])
+    picker = client.get(_link(page.text, "Choose Roblox Instance"))
+    first = picker.text
+    store.recent_refs[:] = [{"ref": "rbx:two", "name": "Two", "className": "Part", "path": ["p", "Two"]}]
+    assert client.get(picker.request.url).text == first
+
+
+def test_recursive_object_editor_supports_open_properties():
+    store.catalog.tools = [{"name": "object_tool", "inputSchema": {"type": "object", "properties": {"properties": {"type": "object", "additionalProperties": True}}, "required": ["properties"]}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/object_tool")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    editor = client.get(_link(view.text, "Edit object"))
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Size": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    value = client.get(_link(editor.text, "Edit Size"))
+    value = client.get(_link(value.text, "Edit as number"), follow_redirects=True)
+    value = client.get(_link(value.text, "Clear"), follow_redirects=True)
+    for char in "0.25": value = client.get(_link(value.text, char), follow_redirects=True)
+    editor = client.get(_link(value.text, "Finish"), follow_redirects=True)
+    final_view = client.get(_link(editor.text, "Back to Draft"))
+    assert '&quot;Size&quot;: 0.25' in final_view.text
+    assert "/agent/draft/" not in editor.text
+
+
+def test_recursive_array_object_editor_supports_two_items():
+    store.catalog.tools = [{"name": "studio_batch", "inputSchema": {"type": "object", "properties": {"operations": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, "required": ["operations"]}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_batch")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    array = client.get(_link(view.text, "Edit array"))
+    object_editor = client.get(_link(array.text, "Add item"), follow_redirects=True)
+    object_editor = client.get(_link(object_editor.text, "Edit item 0"))
+    key = client.get(_link(object_editor.text, "Add field"))
+    for char in "tool": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    object_editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    value = client.get(_link(object_editor.text, "Edit tool"))
+    value = client.get(_link(value.text, "Edit as string"), follow_redirects=True)
+    value = client.get(_link(value.text, "Clear"), follow_redirects=True)
+    for char in "studio_find_instances": value = client.get(_link(value.text, f"Append {char}"), follow_redirects=True)
+    object_editor = client.get(_link(value.text, "Finish"), follow_redirects=True)
+    view = client.get(_link(object_editor.text, "Back to Draft"))
+    array = client.get(_link(view.text, "Edit array"))
+    array = client.get(_link(array.text, "Add item"), follow_redirects=True)
+    final_view = client.get(_link(array.text, "Back to Draft"))
+    assert '&quot;operations&quot;: [' in final_view.text and '&quot;tool&quot;: &quot;studio_find_instances&quot;' in final_view.text
+    assert final_view.text.count("{}") >= 1
+
+
+def test_real_blocking_tool_schemas_expose_generic_immutable_editors():
+    store.catalog.tools = [
+        {"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {"properties": {"additionalProperties": True, "type": "object"}}}},
+        {"name": "studio_set_properties", "inputSchema": {"type": "object", "properties": {"values": {"additionalProperties": True, "type": "object"}}}},
+        {"name": "studio_batch", "inputSchema": {"type": "object", "properties": {"operations": {"items": {"additionalProperties": True, "type": "object"}, "type": "array"}}}},
+    ]
+    store.catalog.tool_count = 3
+    for name, label in [("studio_create_instance", "Edit object"), ("studio_set_properties", "Edit object"), ("studio_batch", "Edit array")]:
+        tool_page = client.get(f"/agent/tool/{name}")
+        started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+        view = client.get(started.headers["location"])
+        assert label in view.text and "/agent/draft/" not in view.text
 
 
 def test_prepared_invocation_keeps_snapshot_after_draft_changes_and_executes_once():

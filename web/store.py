@@ -30,6 +30,7 @@ class MemoryStore:
         self.actions: dict[str, dict[str, Any]] = {}
         self.prepared: dict[str, dict[str, Any]] = {}
         self.result_views: dict[str, dict[str, Any]] = {}
+        self.editors: dict[str, dict[str, Any]] = {}
 
     def create_job(self, job: Job) -> Job:
         with self.lock:

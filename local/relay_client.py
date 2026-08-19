@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 
 from .config import load_config
-from .mcp_adapter import connect_with_backoff
+from .mcp_adapter import connect_with_backoff, safe_close
 from .web_client import RelayWebClient
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -88,13 +88,13 @@ async def run() -> None:
                         await asyncio.to_thread(relay.heartbeat, {"client": client_name, "mcp_connected": False, "studio_connected": False, "tool_count": len(tools), "timestamp": iso_now()})
                     except Exception:
                         pass
-                    await adapter.close()
+                    await safe_close(adapter)
                 adapter = None
                 studio_connected = False
                 await asyncio.sleep(3)
     finally:
         if adapter is not None:
-            await adapter.close()
+            await safe_close(adapter)
         relay.close()
 
 

@@ -18,10 +18,12 @@ Antes de modificar Studio, inspecciona el estado necesario. Después de cada cam
 No construyas URLs /api/v1 manualmente si existe un enlace navegable equivalente. Reutiliza Recent Instances/Recent Results y los candidatos que devuelvan las ejecuciones.
 ```
 
-El flujo navegable es `/agent` → `/agent/tools` → tool real → draft → Prepare Execution → Execute now → result.
+El flujo navegable es `/agent` → `/agent/tools` → tool real → `ViewSnapshot` → Prepare Execution → Execute now → `ResultView`. Cada mutación devuelve una nueva URL inmutable; sigue el redirect/enlace nuevo y no vuelvas a usar la View anterior.
 
 El Agent Gateway usa URLs inmutables generadas por el servidor para views, actions, prepared invocations y result views. Sigue siempre el nuevo enlace `Open Current Draft` o la nueva View que devuelva cada acción; no reutilices una página anterior después de una mutación ni edites URLs.
 Comprueba también `DEPLOY_COMMIT` y `AGENT_PROTOCOL_VERSION` visibles en cada página; si una página no los muestra, trátala como una respuesta legacy/cacheada y vuelve a empezar desde `/`.
+
+Los objetos y arrays se editan desde sus enlaces visibles `Edit object`, `Add field`, `Edit array` y `Add item`. El editor es recursivo: permite construir propiedades, valores anidados y listas de objetos sin inventar URLs ni ids. Los redirects de Agent llevan headers `no-store` para evitar que una respuesta vieja de Render/CDN reemplace una View nueva.
 
 Para workflows de Studio:
 
@@ -31,6 +33,7 @@ Para workflows de Studio:
 - después de una escritura haz una lectura independiente (`get_instance` o `get_properties`);
 - usa recipes para crear, seleccionar y cambiar propiedades;
 - para cualquier string corto, abre `Open String Composer (argument)` y pulsa los caracteres visibles; no construyas rutas de append;
+- para objetos/arrays, usa únicamente `Edit object`/`Edit array` y sus acciones visibles; termina cada valor antes de volver al editor padre;
 - antes de ejecutar inspecciona `PREPARE_ID`, `DRAFT_REVISION`, `ARGUMENTS_SHA256` y `ARGUMENTS` de la página Prepared;
 - para resultados pendientes sigue el enlace `Refresh Result` y usa la nueva Result View; no dependas de `/agent/latest` ni refresques una URL de resultado antigua;
 - el resultado estructurado conserva el candidato de Instance y su path estructurado; el path con puntos es solo `displayPath` humano.

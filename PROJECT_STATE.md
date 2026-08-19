@@ -11,23 +11,26 @@
 - `config.json` actualizado al deploy real `https://mcp-web-roblox.onrender.com`.
 - `run_relay.bat` comprueba el puerto MCP 8787 y arranca el bridge existente si hace falta.
 - El heartbeat devuelve `catalog_present` y `catalog_tool_count`; el cliente republica el catálogo solo cuando falta o está incompleto.
-- Agent Gateway navegable añadido localmente: tools dinámicas, drafts, wizard primitivo, prepare/execute one-shot, resultados y documentación de uso.
+- Agent Gateway navegable añadido localmente: tools dinámicas, ViewSnapshots inmutables, prepare/execute one-shot, resultados y documentación de uso.
 - String Composer navegable para strings cortos: charset completo, valores rápidos, valores recientes, backspace, clear y finish.
 - Instance Picker muestra nombre y className; la discovery de Studio usa el Workspace real bajo `p`.
 - Agent state cache-safe: revisiones de draft, ViewSnapshot inmutables, ActionTokens opacos revision-bound, PreparedInvocation con snapshot/hash y ResultView inmutables.
+- Navigator genérico recursivo para objetos, arrays, valores anidados, enums, booleanos y números; incluye edición de claves arbitrarias, propiedades, listas de objetos y snapshots nuevos tras cada mutación.
+- Redirects de Start/Action con `no-store`, `no-cache`, `CDN-Cache-Control` y `Surrogate-Control`; views congelan acciones, candidatos y valores recientes.
+- Relay endurecido: la limpieza de una conexión MCP fallida no puede matar el bucle de reconexión si el SDK lanza `ExceptionGroup`.
 - Build markers visibles en Agent, health y dashboard: `DEPLOY_COMMIT`, `RENDER_INSTANCE_ID` y `AGENT_PROTOCOL_VERSION=immutable-v1`.
 - Contrato de Instance auditado contra `tools/list`; candidatos recientes conservan `ref`, path estructurado y `displayPath`.
 - El MCP server del bridge corrige la composición de selectors: normaliza snapshots con `id/ref + path` y evita anidarlos como `ref: {id: ...}`.
 
 ## TESTED
 
-- `18 passed` con `C:\Python314\python.exe -m pytest -q`.
+- Suite local completa con `C:\Python314\python.exe -m pytest -q`.
 - `python -m compileall -q web local` correcto.
 - Smoke test con `uvicorn app:app --host 127.0.0.1 --port 8999`: health respondió HTTP 200 y headers no-cache.
 - Render real: `/api/v1/health.json` HTTP 200 y `/` HTTP 200.
 - Render recibió heartbeat: `local_client_online=true`, `mcp_connected=true`, `studio_connected=true`, `tool_count=71`.
 - Tests de recuperación de catálogo: catálogo existente no se reenvía; catálogo ausente se restaura; fallo temporal no termina el cliente.
-- Suite MCP-WEB actual: 25 tests pasan.
+- Suite MCP-WEB actual: cubre redirects immutable, snapshots estables, picker congelado, objetos/arrays recursivos y los schemas reales de create/properties/batch.
 - Suite bridge actual: 19 tests pasan.
 - Bridge versionado localmente sin remote: commit `b39972f0ac60383ff920f1875aa1810d7914593d`.
 - Catálogo público: 71 tools e incluye `studio_list_sessions`.
