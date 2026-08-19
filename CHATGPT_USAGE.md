@@ -21,6 +21,7 @@ No construyas URLs /api/v1 manualmente si existe un enlace navegable equivalente
 El flujo navegable es `/agent` → `/agent/tools` → tool real → draft → Prepare Execution → Execute now → result.
 
 El Agent Gateway usa URLs inmutables generadas por el servidor para views, actions, prepared invocations y result views. Sigue siempre el nuevo enlace `Open Current Draft` o la nueva View que devuelva cada acción; no reutilices una página anterior después de una mutación ni edites URLs.
+Comprueba también `DEPLOY_COMMIT` y `AGENT_PROTOCOL_VERSION` visibles en cada página; si una página no los muestra, trátala como una respuesta legacy/cacheada y vuelve a empezar desde `/`.
 
 Para workflows de Studio:
 

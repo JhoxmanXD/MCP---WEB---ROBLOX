@@ -16,8 +16,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 try:
     from .models import Job
+    from .build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 except ImportError:  # Render runs `uvicorn app:app` from web/
     from models import Job
+    from build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 
 
 def now() -> str:
@@ -52,7 +54,8 @@ STRING_CHARACTER_BY_TOKEN = dict(STRING_CHARACTERS)
 
 
 def agent_page(title: str, body: str) -> HTMLResponse:
-    response = HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{escape(title)}</title><style>body{{font-family:system-ui,sans-serif;max-width:1000px;margin:30px auto;padding:0 18px;color:#172033}}a{{color:#0759b5;margin-right:12px}}pre{{white-space:pre-wrap;background:#f2f5f9;padding:14px;border-radius:8px}}.card{{border:1px solid #d9e0ea;padding:14px;margin:10px 0;border-radius:8px}}.missing{{color:#9a2c00}}code{{background:#eef2f7;padding:2px 4px}}</style></head><body>{body}</body></html>")
+    footer = f"<footer><small>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code> · RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code> · AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></small></footer>"
+    response = HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{escape(title)}</title><style>body{{font-family:system-ui,sans-serif;max-width:1000px;margin:30px auto;padding:0 18px;color:#172033}}a{{color:#0759b5;margin-right:12px}}pre{{white-space:pre-wrap;background:#f2f5f9;padding:14px;border-radius:8px}}.card{{border:1px solid #d9e0ea;padding:14px;margin:10px 0;border-radius:8px}}.missing{{color:#9a2c00}}code{{background:#eef2f7;padding:2px 4px}}footer{{margin-top:28px;color:#667085}}</style></head><body>{body}{footer}</body></html>")
     response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "CDN-Cache-Control": "no-store", "Surrogate-Control": "no-store"})
     return response
 
@@ -261,7 +264,7 @@ def register_agent_routes(app, store, current_studio_connected):
     @app.get("/agent/status", response_class=HTMLResponse)
     async def agent_status():
         heartbeat = store.heartbeat.model_dump(mode="json") if store.heartbeat else {}
-        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
+        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
         return agent_page("Agent Status", body)
 
     @app.get("/agent/tools", response_class=HTMLResponse)

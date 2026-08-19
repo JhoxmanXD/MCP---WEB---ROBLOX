@@ -16,11 +16,13 @@ try:
     from .protocol import parse_arguments
     from .store import MemoryStore
     from .agent import register_agent_routes
+    from .build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 except ImportError:  # Render runs `uvicorn app:app` from web/
     from models import Catalog, Heartbeat, Job
     from protocol import parse_arguments
     from store import MemoryStore
     from agent import register_agent_routes
+    from build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 
 app = FastAPI(title="MCP-WEB", version="0.1.0")
 store = MemoryStore()
@@ -31,7 +33,7 @@ register_agent_routes(app, store, lambda: current_studio_connected())
 
 
 def no_cache(response: JSONResponse) -> JSONResponse:
-    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
+    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "CDN-Cache-Control": "no-store", "Surrogate-Control": "no-store"})
     return response
 
 
@@ -67,7 +69,7 @@ async def dashboard() -> FileResponse:
 @app.get("/read/health", response_class=HTMLResponse)
 async def read_health() -> HTMLResponse:
     heartbeat = store.heartbeat
-    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected and store.online())).lower()}</p><p><strong>studio_connected:</strong> {str(current_studio_connected()).lower()}</p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected and store.online())).lower()}</p><p><strong>studio_connected:</strong> {str(current_studio_connected()).lower()}</p><p><strong>DEPLOY_COMMIT:</strong> <code>{escape(DEPLOY_COMMIT)}</code></p><p><strong>RENDER_INSTANCE_ID:</strong> <code>{escape(RENDER_INSTANCE_ID)}</code></p><p><strong>AGENT_PROTOCOL_VERSION:</strong> <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
     return html_page("MCP-WEB Health", body)
 
 
@@ -123,7 +125,7 @@ async def read_latest() -> HTMLResponse:
 @app.get("/api/v1/health")
 @app.get("/api/v1/health.json")
 async def health() -> JSONResponse:
-    return payload({"ok": True, "service": "MCP-WEB", "version": "0.1.0", "local_client_online": store.online()})
+    return payload({"ok": True, "service": "MCP-WEB", "version": "0.1.0", "local_client_online": store.online(), "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION})
 
 
 @app.get("/api/v1/catalog.json")
@@ -204,4 +206,4 @@ async def state(state_key: str) -> JSONResponse:
 
 @app.get("/api/v1/dashboard.json")
 async def dashboard_data() -> JSONResponse:
-    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
+    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})

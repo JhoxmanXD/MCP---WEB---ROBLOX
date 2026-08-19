@@ -15,6 +15,7 @@
 - String Composer navegable para strings cortos: charset completo, valores rápidos, valores recientes, backspace, clear y finish.
 - Instance Picker muestra nombre y className; la discovery de Studio usa el Workspace real bajo `p`.
 - Agent state cache-safe: revisiones de draft, ViewSnapshot inmutables, ActionTokens opacos revision-bound, PreparedInvocation con snapshot/hash y ResultView inmutables.
+- Build markers visibles en Agent, health y dashboard: `DEPLOY_COMMIT`, `RENDER_INSTANCE_ID` y `AGENT_PROTOCOL_VERSION=immutable-v1`.
 - Contrato de Instance auditado contra `tools/list`; candidatos recientes conservan `ref`, path estructurado y `displayPath`.
 - El MCP server del bridge corrige la composición de selectors: normaliza snapshots con `id/ref + path` y evita anidarlos como `ref: {id: ...}`.
 
@@ -26,7 +27,7 @@
 - Render real: `/api/v1/health.json` HTTP 200 y `/` HTTP 200.
 - Render recibió heartbeat: `local_client_online=true`, `mcp_connected=true`, `studio_connected=true`, `tool_count=71`.
 - Tests de recuperación de catálogo: catálogo existente no se reenvía; catálogo ausente se restaura; fallo temporal no termina el cliente.
-- Suite MCP-WEB actual: 23 tests pasan.
+- Suite MCP-WEB actual: 25 tests pasan.
 - Suite bridge actual: 19 tests pasan.
 - Bridge versionado localmente sin remote: commit `b39972f0ac60383ff920f1875aa1810d7914593d`.
 - Catálogo público: 71 tools e incluye `studio_list_sessions`.

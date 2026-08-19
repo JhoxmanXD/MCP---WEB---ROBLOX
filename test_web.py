@@ -218,6 +218,36 @@ def test_stale_prepare_action_is_rejected_without_mutating_or_preparing():
     assert "Workspace" in current.text
 
 
+def test_public_agent_case_preserves_query_and_prepared_snapshot_uses_only_opaque_links():
+    store.catalog.tools = [{"name": "studio_find_instances", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "class_name": {"type": "string"}}, "required": ["query", "class_name"]}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_find_instances")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    assert re.search(r"/agent/view/V_[^']+", started.headers["location"])
+    assert "/agent/draft/" not in view.text and "/agent/action/A_" in view.text
+    composer = client.get(_link(view.text, "Open String Composer (query)"))
+    for char in "SOL_MCP":
+        composer = client.get(_link(composer.text, f"Append {char}"), follow_redirects=True)
+    view = client.get(_link(composer.text, "Finish"), follow_redirects=True)
+    assert 'value: <code>SOL_MCP</code>' in view.text
+    assert 'value: <code>&lt;missing&gt;</code>' in view.text
+    prepared = client.get(_links(view.text, "Set Folder")[1], follow_redirects=True)
+    prepared = client.get(_link(prepared.text, "Prepare Execution"), follow_redirects=True)
+    assert '"query": "SOL_MCP"' in prepared.text or '&quot;query&quot;: &quot;SOL_MCP&quot;' in prepared.text
+    assert '"class_name": "Folder"' in prepared.text or '&quot;class_name&quot;: &quot;Folder&quot;' in prepared.text
+    assert "/agent/prepared/P_" in str(prepared.request.url)
+
+
+def test_build_markers_are_visible_on_agent_and_health():
+    agent_status = client.get("/agent/status")
+    assert "DEPLOY_COMMIT:" in agent_status.text
+    assert "RENDER_INSTANCE_ID:" in agent_status.text
+    assert "AGENT_PROTOCOL_VERSION:" in agent_status.text
+    health = client.get("/api/v1/health.json").json()
+    assert health["agent_protocol_version"] == "immutable-v1"
+
+
 def test_prepared_invocation_keeps_snapshot_after_draft_changes_and_executes_once():
     view = client.get(_start_string_draft().request.url)
     view = client.get(_link(view.text, "Set Part"), follow_redirects=True)
