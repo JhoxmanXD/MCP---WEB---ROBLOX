@@ -10,7 +10,7 @@ client = TestClient(app)
 
 def setup_function():
     store.jobs.clear(); store.queue.clear(); store.states.clear(); store.latest = None
-    store.recent_refs.clear(); store.drafts.clear()
+    store.recent_refs.clear(); store.recent_string_values.clear(); store.drafts.clear()
     store.catalog.tools = [{"name": "read_tool", "description": "read", "inputSchema": {}}]
     store.catalog.tool_count = 1
 
@@ -139,3 +139,59 @@ def test_agent_candidate_contract_keeps_structured_path_and_display_path():
     picker = client.get("/agent/tool/studio_find_instances")
     assert picker.status_code == 200
     assert store.recent_refs[-1]["path"] == ["p", "Foo", "Bar"]
+
+
+def _link(html: str, label: str) -> str:
+    match = re.search(r"<a href='([^']+)'>(?:" + re.escape(label) + r")</a>", html)
+    assert match, f"missing link: {label}"
+    return match.group(1)
+
+
+def _start_string_draft():
+    store.catalog.tools = [{
+        "name": "studio_create_instance",
+        "description": "create",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"class_name": {"type": "string"}, "name": {"type": "string"}},
+            "required": ["class_name", "name"],
+        },
+    }]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    start = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    return client.get(start.headers["location"])
+
+
+def _compose_via_visible_links(draft_page, value: str, argument: str = "name"):
+    composer = client.get(_link(draft_page.text, f"Open String Composer ({argument})"))
+    assert "String Composer" in composer.text
+    for char in value:
+        label = f"Append {char}" if char != " " else "Append space"
+        composer = client.get(_link(composer.text, label), follow_redirects=True)
+    finished = client.get(_link(composer.text, "Finish"), follow_redirects=True)
+    assert f"<code>{value}</code>" in finished.text
+    return finished
+
+
+def test_string_composer_builds_case_sensitive_values_using_only_generated_links():
+    first = _compose_via_visible_links(_start_string_draft(), "SOL_MCP_FINAL_TEST")
+    assert "Open String Composer" in first.text
+    second = _compose_via_visible_links(_start_string_draft(), "WebControlledPart")
+    assert "WebControlledPart" in second.text
+
+
+def test_string_composer_charset_and_edit_actions_are_navigable():
+    draft = _start_string_draft()
+    composer = client.get(_link(draft.text, "Open String Composer (name)"))
+    for label in ["Append A", "Append B", "Append C", "Append 1", "Append _", "Append -", "Append 2", "Append .", "Append space"]:
+        assert label in composer.text
+    for label in ["Append A", "Append B", "Append C"]:
+        composer = client.get(_link(composer.text, label), follow_redirects=True)
+    composer = client.get(_link(composer.text, "Backspace"), follow_redirects=True)
+    assert "CURRENT VALUE: <code>AB</code>" in composer.text
+    composer = client.get(_link(composer.text, "Clear"), follow_redirects=True)
+    assert "CURRENT VALUE: <code></code>" in composer.text
+    finished = client.get(_link(composer.text, "Finish"), follow_redirects=True)
+    assert "Complete required arguments first" in finished.text
+    assert "Workspace" in finished.text and "Recent" not in finished.text

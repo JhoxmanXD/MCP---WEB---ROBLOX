@@ -12,6 +12,8 @@
 - `run_relay.bat` comprueba el puerto MCP 8787 y arranca el bridge existente si hace falta.
 - El heartbeat devuelve `catalog_present` y `catalog_tool_count`; el cliente republica el catálogo solo cuando falta o está incompleto.
 - Agent Gateway navegable añadido localmente: tools dinámicas, drafts, wizard primitivo, prepare/execute one-shot, resultados y documentación de uso.
+- String Composer navegable para strings cortos: charset completo, valores rápidos, valores recientes, backspace, clear y finish.
+- Instance Picker muestra nombre y className; la discovery de Studio usa el Workspace real bajo `p`.
 - Contrato de Instance auditado contra `tools/list`; candidatos recientes conservan `ref`, path estructurado y `displayPath`.
 - El MCP server del bridge corrige la composición de selectors: normaliza snapshots con `id/ref + path` y evita anidarlos como `ref: {id: ...}`.
 
@@ -23,7 +25,7 @@
 - Render real: `/api/v1/health.json` HTTP 200 y `/` HTTP 200.
 - Render recibió heartbeat: `local_client_online=true`, `mcp_connected=true`, `studio_connected=true`, `tool_count=71`.
 - Tests de recuperación de catálogo: catálogo existente no se reenvía; catálogo ausente se restaura; fallo temporal no termina el cliente.
-- Suite MCP-WEB actual: 18 tests pasan.
+- Suite MCP-WEB actual: 20 tests pasan.
 - Suite bridge actual: 19 tests pasan.
 - Bridge versionado localmente sin remote: commit `b39972f0ac60383ff920f1875aa1810d7914593d`.
 - Catálogo público: 71 tools e incluye `studio_list_sessions`.
@@ -41,6 +43,7 @@
 - La reproducción de composición confirmó el fallo anterior: create/find devolvían el descriptor, pero get/set recibían el selector envuelto bajo `ref`; el fix está en el MCP server, no en MCP-WEB ni en el plugin.
 - Lifecycle E2E confirmado: el problema de `session_count=0` tras reinicio era un proceso `stdio` huérfano con otro `SessionManager`; `stop.ps1` ahora limpia también esos procesos para que `8787` y `8788` pertenezcan a una sola instancia.
 - E2E Agent Gateway confirmado con Studio real: create `MCP_WEB_CHAIN_TEST`, set `Anchored=true`, lectura independiente, rename a `MCP_WEB_CHAIN_TEST_RENAMED` y find final.
+- E2E Agent Gateway con navegación solo por href: creó `SOL_MCP_FINAL_TEST`, creó `WebControlledPart` dentro, aplicó `Anchored=true` y verificó find/properties de forma independiente.
 
 ## PENDING
 

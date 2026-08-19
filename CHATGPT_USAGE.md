@@ -27,6 +27,7 @@ Para workflows de Studio:
 - reutiliza `Recent Instances`/`Recent Results`; no inventes `ref`, `id`, paths ni schemas;
 - después de una escritura haz una lectura independiente (`get_instance` o `get_properties`);
 - usa recipes para crear, seleccionar y cambiar propiedades;
+- para cualquier string corto, abre `Open String Composer (argument)` y pulsa los caracteres visibles; no construyas rutas de append;
 - el resultado estructurado conserva el candidato de Instance y su path estructurado; el path con puntos es solo `displayPath` humano.
 
 El modo de enlaces está pensado para argumentos cortos. Para source Luau o JSON grande, usa la API raw existente o el modo humano cuando esté disponible.

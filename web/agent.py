@@ -39,6 +39,16 @@ def href(path: str, label: str) -> str:
     return f"<a href='{escape(path)}'>{escape(label)}</a>"
 
 
+STRING_CHARACTERS = (
+    [(f"upper_{char}", char) for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+    + [(f"lower_{char}", char) for char in "abcdefghijklmnopqrstuvwxyz"]
+    + [(f"digit_{char}", char) for char in "0123456789"]
+    + [("underscore", "_"), ("hyphen", "-"), ("dot", "."), ("slash", "/"), ("space", " ")]
+    + [(f"symbol_{index}", char) for index, char in enumerate(":()[]{},=+")]
+)
+STRING_CHARACTER_BY_TOKEN = dict(STRING_CHARACTERS)
+
+
 def agent_page(title: str, body: str) -> HTMLResponse:
     response = HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{escape(title)}</title><style>body{{font-family:system-ui,sans-serif;max-width:1000px;margin:30px auto;padding:0 18px;color:#172033}}a{{color:#0759b5;margin-right:12px}}pre{{white-space:pre-wrap;background:#f2f5f9;padding:14px;border-radius:8px}}.card{{border:1px solid #d9e0ea;padding:14px;margin:10px 0;border-radius:8px}}.missing{{color:#9a2c00}}code{{background:#eef2f7;padding:2px 4px}}</style></head><body>{body}</body></html>")
     response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
@@ -78,6 +88,13 @@ def register_agent_routes(app, store, current_studio_connected):
 
     def missing(draft: dict[str, Any]) -> list[str]:
         return [name for name in required(draft["schema"]) if name not in draft["arguments"]]
+
+    def remember_string(value: str) -> None:
+        if value and value in store.recent_string_values:
+            store.recent_string_values.remove(value)
+        if value:
+            store.recent_string_values.append(value)
+            del store.recent_string_values[:-12]
 
     async def discover(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
         if tool_name not in catalog_tools():
@@ -141,10 +158,9 @@ def register_agent_routes(app, store, current_studio_connected):
             links.append(href(f"/agent/draft/{draft['draft_id']}/arg/{quote(name, safe='')}/number", "Number composer"))
         elif typ == "string":
             values = [schema.get("default"), "Workspace", "Part", "Folder", "Model", "Script", "Name", "Parent"]
-            if name in {"name", "query"}:
-                values += ["MCP_WEB_CHAIN_TEST", "MCP_WEB_CHAIN_TEST_RENAMED"]
+            values += list(reversed(store.recent_string_values))
             links += [href(base + quote(json.dumps(value), safe=''), f"Set {value}") for value in values if value is not None]
-            links += [href(f"/agent/draft/{draft['draft_id']}/arg/{quote(name, safe='')}/token/{quote(token, safe='')}", f"Append {token}") for token in ["a", "b", "0", "_", ".", "/"]]
+            links.append(href(f"/agent/draft/{draft['draft_id']}/string/{quote(name, safe='')}", f"Open String Composer ({name})"))
         if name.lower() in {"ref", "parent", "target", "instance", "selection", "script", "object"} or typ == "object":
             links.append(href(f"/agent/draft/{draft['draft_id']}/arg/{quote(name, safe='')}/picker", "Choose Roblox Instance"))
         if nullable(schema):
@@ -210,6 +226,61 @@ def register_agent_routes(app, store, current_studio_connected):
     @app.get("/agent/draft/{draft_id}/arg/{name}/token/{token}")
     async def append_token(draft_id: str, name: str, token: str):
         draft = draft_or_404(draft_id); draft["arguments"][name] = str(draft["arguments"].get(name, "")) + token; draft["last_access"] = now()
+        return RedirectResponse(f"/agent/draft/{draft_id}", status_code=303)
+
+    @app.get("/agent/draft/{draft_id}/string/{name}", response_class=HTMLResponse)
+    async def string_composer(draft_id: str, name: str):
+        draft = draft_or_404(draft_id)
+        schema = draft["schema"].get("properties", {}).get(name, {})
+        if schema_type(schema) != "string":
+            raise HTTPException(400, "Argument is not a string")
+        current = str(draft["arguments"].get(name, ""))
+        encoded_name = quote(name, safe="")
+        base = f"/agent/draft/{draft_id}/string/{encoded_name}"
+        character_links = " ".join(
+            href(f"{base}/append/{token}", f"Append {escape(char) if char != ' ' else 'space'}")
+            for token, char in STRING_CHARACTERS
+        )
+        actions = " ".join([
+            href(f"{base}/backspace", "Backspace"),
+            href(f"{base}/clear", "Clear"),
+            href(f"{base}/finish", "Finish"),
+            href(f"/agent/draft/{draft_id}", "Back to Draft"),
+        ])
+        body = f"<h1>String Composer</h1><p>DRAFT_ID: <code>{escape(draft_id)}</code></p><p>ARGUMENT: <code>{escape(name)}</code></p><p>CURRENT VALUE: <code>{escape(current)}</code></p><h2>Characters</h2><p>{character_links}</p><h2>Actions</h2><p>{actions}</p>"
+        return agent_page("String Composer", body)
+
+    @app.get("/agent/draft/{draft_id}/string/{name}/append/{token}")
+    async def string_append(draft_id: str, name: str, token: str):
+        draft = draft_or_404(draft_id)
+        character = STRING_CHARACTER_BY_TOKEN.get(token)
+        if character is None:
+            raise HTTPException(404, "Unknown string composer character")
+        draft["arguments"][name] = str(draft["arguments"].get(name, "")) + character
+        draft["last_access"] = now()
+        return RedirectResponse(f"/agent/draft/{draft_id}/string/{quote(name, safe='')}", status_code=303)
+
+    @app.get("/agent/draft/{draft_id}/string/{name}/backspace")
+    async def string_backspace(draft_id: str, name: str):
+        draft = draft_or_404(draft_id)
+        draft["arguments"][name] = str(draft["arguments"].get(name, ""))[:-1]
+        draft["last_access"] = now()
+        return RedirectResponse(f"/agent/draft/{draft_id}/string/{quote(name, safe='')}", status_code=303)
+
+    @app.get("/agent/draft/{draft_id}/string/{name}/clear")
+    async def string_clear(draft_id: str, name: str):
+        draft = draft_or_404(draft_id)
+        draft["arguments"].pop(name, None)
+        draft["last_access"] = now()
+        return RedirectResponse(f"/agent/draft/{draft_id}/string/{quote(name, safe='')}", status_code=303)
+
+    @app.get("/agent/draft/{draft_id}/string/{name}/finish")
+    async def string_finish(draft_id: str, name: str):
+        draft = draft_or_404(draft_id)
+        value = str(draft["arguments"].get(name, ""))
+        draft["arguments"][name] = value
+        remember_string(value)
+        draft["last_access"] = now()
         return RedirectResponse(f"/agent/draft/{draft_id}", status_code=303)
 
     @app.get("/agent/draft/{draft_id}/arg/{name}/clear")
@@ -314,6 +385,8 @@ def register_agent_routes(app, store, current_studio_connected):
         for candidate in store.recent_refs[-50:]:
             candidate_url = quote(json.dumps(candidate), safe="")
             label = str(candidate.get("name", candidate.get("path", candidate.get("ref", "candidate"))))
+            if candidate.get("className"):
+                label = f"{label} ({candidate['className']})"
             candidate_links.append(f"<li>{href(f'/agent/draft/{draft_id}/arg/{encoded_name}/pick/{candidate_url}', label)} — {escape(str(candidate.get('className', '')))} — {escape(str(candidate.get('path', candidate.get('ref', ''))))}</li>")
         links = "".join(candidate_links)
         return agent_page("Roblox Instance Picker", f"<h1>Roblox Instance Picker</h1><p>Recent references:</p><ul>{links or '<li>No recent references yet. Run a read recipe first.</li>'}</ul>{href('/agent/recipes', 'Discover Studio State')} {href('/agent/draft/' + draft_id, 'Back to draft')}")
@@ -367,7 +440,7 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/discover/tree", response_class=HTMLResponse)
     async def discover_tree():
-        result = await discover("studio_get_tree", {"root": "game", "depth": 2})
+        result = await discover("studio_get_tree", {"root": "p", "depth": 2})
         return agent_page("Studio Tree Discovery", f"<h1>Studio Tree Discovery</h1><p>Recent refs: {len(store.recent_refs)}</p><pre>{escape(json.dumps(result, ensure_ascii=False, indent=2, default=str))}</pre>{href('/agent/recipes', 'Recipes')} {href('/agent', 'Agent Home')}")
 
     @app.get("/agent/discover/selection", response_class=HTMLResponse)
@@ -377,4 +450,4 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/help", response_class=HTMLResponse)
     async def agent_help():
-        return agent_page("Agent Help", f"<h1>Agent Gateway Help</h1><p>Start at Agent Tools, open a real tool, create a draft, set arguments with links, prepare, then execute once.</p><p>Large free-text values are intentionally limited in link mode; use the existing raw API for large scripts.</p>{href('/agent', 'Agent Home')} {href('/read/health', 'Health')}")
+        return agent_page("Agent Help", f"<h1>Agent Gateway Help</h1><p>Start at Agent Tools, open a real tool, create a draft, set arguments with links, prepare, then execute once.</p><p>Short free-text is supported through String Composer. Large free-text values and long Luau remain conditional; link navigation is not intended for hundreds of lines.</p>{href('/agent', 'Agent Home')} {href('/read/health', 'Health')}")

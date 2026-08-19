@@ -25,6 +25,7 @@ class MemoryStore:
         self.heartbeat: Heartbeat | None = None
         self.drafts: dict[str, dict[str, Any]] = {}
         self.recent_refs: list[dict[str, Any]] = []
+        self.recent_string_values: list[str] = []
 
     def create_job(self, job: Job) -> Job:
         with self.lock:
