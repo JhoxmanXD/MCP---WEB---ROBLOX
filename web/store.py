@@ -72,6 +72,11 @@ class MemoryStore:
     def online(self) -> bool:
         if not self.heartbeat:
             return False
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(self.heartbeat.timestamp)).total_seconds()
+            return age < 15
+        except ValueError:
+            return False
 
     def replace_catalog(self, tools: list[dict[str, Any]], studio_connected: bool, updated_at: str | None = None) -> Catalog:
         with self.lock:
@@ -87,8 +92,3 @@ class MemoryStore:
                 values["updated_at"] = updated_at
             self.catalog = Catalog(**values)
             return self.catalog
-        try:
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(self.heartbeat.timestamp)).total_seconds()
-            return age < 15
-        except ValueError:
-            return False

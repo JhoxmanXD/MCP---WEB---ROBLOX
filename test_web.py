@@ -52,6 +52,7 @@ def test_heartbeat_reports_catalog_presence():
     response = client.post("/api/v1/client/heartbeat", json={"client": "test", "tool_count": 1, "mcp_connected": True, "studio_connected": True})
     assert response.json()["catalog_present"] is True
     assert response.json()["catalog_tool_count"] == 1
+    assert client.get("/api/v1/dashboard.json").json()["local_client_online"] is True
 
 
 def test_heartbeat_reports_missing_catalog():
