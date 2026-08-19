@@ -46,6 +46,16 @@ def text_value(value: Any) -> str:
     return escape(json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
 
+def current_studio_connected() -> bool:
+    return store.online() and store.catalog.studio_connected
+
+
+def catalog_data() -> dict[str, Any]:
+    data = store.catalog.model_dump(mode="json")
+    data["studio_connected"] = current_studio_connected()
+    return data
+
+
 @app.get("/")
 async def dashboard() -> FileResponse:
     return FileResponse(STATIC / "index.html")
@@ -54,15 +64,15 @@ async def dashboard() -> FileResponse:
 @app.get("/read/health", response_class=HTMLResponse)
 async def read_health() -> HTMLResponse:
     heartbeat = store.heartbeat
-    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected)).lower()}</p><p><strong>studio_connected:</strong> {str(store.catalog.studio_connected).lower()}</p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected and store.online())).lower()}</p><p><strong>studio_connected:</strong> {str(current_studio_connected()).lower()}</p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
     return html_page("MCP-WEB Health", body)
 
 
 @app.get("/read/catalog", response_class=HTMLResponse)
 async def read_catalog() -> HTMLResponse:
-    catalog_data = store.catalog.model_dump(mode="json")
-    items = "".join(f"<li><code>{escape(str(tool.get('name', '')))}</code> — {escape(str(tool.get('description', '')))}</li>" for tool in catalog_data["tools"])
-    body = f"<h1>MCP-WEB LIVE CATALOG</h1><p><strong>server_instance_id:</strong> <code>{escape(catalog_data['server_instance_id'])}</code></p><p><strong>catalog_generation:</strong> {catalog_data['catalog_generation']}</p><p><strong>updated_at:</strong> {escape(catalog_data['updated_at'])}</p><p><strong>studio_connected:</strong> {str(catalog_data['studio_connected']).lower()}</p><p><strong>tool_count:</strong> {catalog_data['tool_count']}</p><h2>Tools</h2><ol>{items}</ol><p><a href='/'>Home</a> · <a href='/read/health'>Live Health</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    live_catalog = catalog_data()
+    items = "".join(f"<li><code>{escape(str(tool.get('name', '')))}</code> — {escape(str(tool.get('description', '')))}</li>" for tool in live_catalog["tools"])
+    body = f"<h1>MCP-WEB LIVE CATALOG</h1><p><strong>server_instance_id:</strong> <code>{escape(live_catalog['server_instance_id'])}</code></p><p><strong>catalog_generation:</strong> {live_catalog['catalog_generation']}</p><p><strong>updated_at:</strong> {escape(live_catalog['updated_at'])}</p><p><strong>studio_connected:</strong> {str(live_catalog['studio_connected']).lower()}</p><p><strong>tool_count:</strong> {live_catalog['tool_count']}</p><h2>Tools</h2><ol>{items}</ol><p><a href='/'>Home</a> · <a href='/read/health'>Live Health</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
     return html_page("MCP-WEB Live Catalog", body)
 
 
@@ -115,7 +125,7 @@ async def health() -> JSONResponse:
 
 @app.get("/api/v1/catalog.json")
 async def catalog() -> JSONResponse:
-    return payload(store.catalog.model_dump(mode="json"))
+    return payload(catalog_data())
 
 
 @app.post("/api/v1/catalog")
@@ -124,7 +134,7 @@ async def upload_catalog(body: dict[str, Any]) -> JSONResponse:
     if not isinstance(tools, list):
         raise HTTPException(400, "tools must be a list")
     store.replace_catalog(tools, bool(body.get("studio_connected")), body.get("updated_at"))
-    return payload(store.catalog.model_dump(mode="json"))
+    return payload(catalog_data())
 
 
 @app.post("/api/v1/client/heartbeat")
@@ -191,4 +201,4 @@ async def state(state_key: str) -> JSONResponse:
 
 @app.get("/api/v1/dashboard.json")
 async def dashboard_data() -> JSONResponse:
-    return payload({"health": True, "local_client_online": store.online(), "studio_connected": store.catalog.studio_connected, "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
+    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})

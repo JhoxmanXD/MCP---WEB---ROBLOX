@@ -50,3 +50,14 @@ def test_catalog_restore_skips_existing_and_restores_missing():
     failing = FakeRelay(fails=True)
     assert restore_catalog_if_needed(failing, tools, {"catalog_present": False, "catalog_tool_count": 0}) is False
     assert failing.calls == 1
+
+
+def test_mcp_adapter_reports_studio_session_state():
+    adapter = StreamableHTTPMCP("http://example.invalid/mcp")
+
+    class Session:
+        async def call_tool(self, name, arguments):
+            return {"isError": False, "structuredContent": {"data": {"sessions": [{"session_id": "studio-1"}]}}}
+
+    adapter.session = Session()
+    assert asyncio.run(adapter.studio_connected()) is True

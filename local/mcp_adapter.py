@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -31,6 +32,25 @@ class StreamableHTTPMCP:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         result = await self.session.call_tool(name, arguments)
         return jsonable(result)
+
+    async def studio_connected(self) -> bool:
+        result = await self.call_tool("studio_list_sessions", {})
+        if result.get("isError"):
+            return False
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            data = structured.get("data")
+            if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+                return bool(data["sessions"])
+        for item in result.get("content", []):
+            text = item.get("text") if isinstance(item, dict) else None
+            if isinstance(text, str):
+                try:
+                    data = json.loads(text).get("data", {})
+                    return bool(data.get("sessions", []))
+                except (ValueError, TypeError):
+                    continue
+        return False
 
 
 async def connect_with_backoff(url: str, attempts: int = 3) -> StreamableHTTPMCP:

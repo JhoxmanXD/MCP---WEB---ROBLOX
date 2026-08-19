@@ -63,6 +63,13 @@ def test_heartbeat_reports_missing_catalog():
     assert response.json()["catalog_tool_count"] == 0
 
 
+def test_dashboard_marks_studio_offline_when_heartbeat_says_offline():
+    client.post("/api/v1/client/heartbeat", json={"client": "test", "tool_count": 1, "mcp_connected": False, "studio_connected": False})
+    dashboard = client.get("/api/v1/dashboard.json").json()
+    assert dashboard["local_client_online"] is True
+    assert dashboard["studio_connected"] is False
+
+
 def test_navigable_read_routes_and_no_cache(monkeypatch):
     from web import app as app_module
     monkeypatch.setattr(app_module, "READ_WAIT_SECONDS", 0.01)

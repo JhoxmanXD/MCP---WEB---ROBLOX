@@ -25,7 +25,7 @@ def restore_catalog_if_needed(relay: RelayWebClient, tools: list[dict], heartbea
     if not catalog_needs_repair(heartbeat, len(tools)):
         return False
     try:
-        relay.catalog(tools, True)
+        relay.catalog(tools, bool(heartbeat.get("studio_connected")))
         return True
     except Exception as exc:
         log.warning("[WEB] Catalog upload failed; retrying: %s", exc)
@@ -36,11 +36,14 @@ async def run() -> None:
     config = load_config()
     relay = RelayWebClient(config["relay_url"])
     interval = float(config.get("poll_interval_seconds", 1.0))
+    studio_check_interval = float(config.get("studio_check_interval_seconds", 5.0))
     client_name = config.get("client_name", "local-mcp-client")
     mcp_url = config.get("mcp_url", "http://127.0.0.1:8787/mcp")
     log.info("[MCP-WEB] Starting...")
     adapter = None
     tools: list[dict] = []
+    studio_connected = False
+    last_studio_check = 0.0
     try:
         while True:
             try:
@@ -49,7 +52,19 @@ async def run() -> None:
                     adapter = await connect_with_backoff(mcp_url)
                     tools = await adapter.list_tools()
                     log.info("[MCP] Connected — %d tools discovered", len(tools))
-                heartbeat = relay.heartbeat({"client": client_name, "mcp_connected": True, "studio_connected": True, "tool_count": len(tools), "timestamp": iso_now()})
+                    last_studio_check = 0.0
+                now = time.monotonic()
+                if now - last_studio_check >= studio_check_interval:
+                    studio_connected = "studio_list_sessions" in {tool.get("name") for tool in tools}
+                    if studio_connected:
+                        try:
+                            studio_connected = await adapter.studio_connected()
+                        except Exception as exc:
+                            studio_connected = False
+                            log.warning("[STUDIO] Connection check failed: %s", exc)
+                    log.info("[STUDIO] %s", "connected" if studio_connected else "disconnected")
+                    last_studio_check = now
+                heartbeat = relay.heartbeat({"client": client_name, "mcp_connected": True, "studio_connected": studio_connected, "tool_count": len(tools), "timestamp": iso_now()})
                 if await asyncio.to_thread(restore_catalog_if_needed, relay, tools, heartbeat):
                     log.info("[WEB] Catalog uploaded/restored (%d tools)", len(tools))
                 job = await asyncio.to_thread(relay.next_job)
@@ -69,8 +84,13 @@ async def run() -> None:
             except Exception as exc:
                 log.warning("[RECONNECT] %s", exc)
                 if adapter is not None:
+                    try:
+                        await asyncio.to_thread(relay.heartbeat, {"client": client_name, "mcp_connected": False, "studio_connected": False, "tool_count": len(tools), "timestamp": iso_now()})
+                    except Exception:
+                        pass
                     await adapter.close()
                 adapter = None
+                studio_connected = False
                 await asyncio.sleep(3)
     finally:
         if adapter is not None:
