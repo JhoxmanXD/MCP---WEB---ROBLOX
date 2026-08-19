@@ -20,6 +20,8 @@ No construyas URLs /api/v1 manualmente si existe un enlace navegable equivalente
 
 El flujo navegable es `/agent` → `/agent/tools` → tool real → draft → Prepare Execution → Execute now → result.
 
+El Agent Gateway usa URLs inmutables generadas por el servidor para views, actions, prepared invocations y result views. Sigue siempre el nuevo enlace `Open Current Draft` o la nueva View que devuelva cada acción; no reutilices una página anterior después de una mutación ni edites URLs.
+
 Para workflows de Studio:
 
 - empieza siempre en `/` y entra al Agent Gateway mediante sus enlaces visibles;
@@ -28,6 +30,8 @@ Para workflows de Studio:
 - después de una escritura haz una lectura independiente (`get_instance` o `get_properties`);
 - usa recipes para crear, seleccionar y cambiar propiedades;
 - para cualquier string corto, abre `Open String Composer (argument)` y pulsa los caracteres visibles; no construyas rutas de append;
+- antes de ejecutar inspecciona `PREPARE_ID`, `DRAFT_REVISION`, `ARGUMENTS_SHA256` y `ARGUMENTS` de la página Prepared;
+- para resultados pendientes sigue el enlace `Refresh Result` y usa la nueva Result View; no dependas de `/agent/latest` ni refresques una URL de resultado antigua;
 - el resultado estructurado conserva el candidato de Instance y su path estructurado; el path con puntos es solo `displayPath` humano.
 
 El modo de enlaces está pensado para argumentos cortos. Para source Luau o JSON grande, usa la API raw existente o el modo humano cuando esté disponible.

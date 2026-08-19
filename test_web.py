@@ -10,7 +10,7 @@ client = TestClient(app)
 
 def setup_function():
     store.jobs.clear(); store.queue.clear(); store.states.clear(); store.latest = None
-    store.recent_refs.clear(); store.recent_string_values.clear(); store.drafts.clear()
+    store.recent_refs.clear(); store.recent_string_values.clear(); store.drafts.clear(); store.views.clear(); store.actions.clear(); store.prepared.clear(); store.result_views.clear()
     store.catalog.tools = [{"name": "read_tool", "description": "read", "inputSchema": {}}]
     store.catalog.tool_count = 1
 
@@ -112,17 +112,17 @@ def test_agent_gateway_draft_prepare_and_one_shot_execute():
     draft_url = started.headers["location"]
     draft = client.get(draft_url)
     assert "Missing required: enabled" in draft.text
-    draft_id = draft_url.rsplit("/", 1)[-1]
-    set_value = client.get(f"/agent/draft/{draft_id}/arg/enabled/set/true", follow_redirects=False)
-    assert set_value.status_code == 303
-    prepared = client.get(f"/agent/draft/{draft_id}/prepare", follow_redirects=False)
+    set_value = client.get(_link(draft.text, "Set true"), follow_redirects=True)
+    assert set_value.status_code == 200
+    prepared = client.get(_link(set_value.text, "Prepare Execution"), follow_redirects=True)
     assert prepared.status_code == 200
-    execute_link = re.search(r"/agent/execute/[^']+", prepared.text).group(0)
+    execute_link = _link(prepared.text, "Execute now")
     executed = client.get(execute_link, follow_redirects=False)
     assert executed.status_code == 303
-    request_id = executed.headers["location"].rsplit("/", 1)[-1]
+    result_page = client.get(executed.headers["location"])
+    request_id = re.search(r"REQUEST_ID: <code>([^<]+)", result_page.text).group(1)
     repeat = client.get(execute_link, follow_redirects=False)
-    assert repeat.headers["location"].endswith(request_id)
+    assert repeat.headers["location"] == executed.headers["location"]
     assert len([job for job in store.jobs.values() if job.request_id == request_id]) == 1
 
 
@@ -145,6 +145,10 @@ def _link(html: str, label: str) -> str:
     match = re.search(r"<a href='([^']+)'>(?:" + re.escape(label) + r")</a>", html)
     assert match, f"missing link: {label}"
     return match.group(1)
+
+
+def _links(html: str, label: str) -> list[str]:
+    return [match.group(1) for match in re.finditer(r"<a href='([^']+)'>(?:" + re.escape(label) + r")</a>", html)]
 
 
 def _start_string_draft():
@@ -195,3 +199,58 @@ def test_string_composer_charset_and_edit_actions_are_navigable():
     finished = client.get(_link(composer.text, "Finish"), follow_redirects=True)
     assert "Complete required arguments first" in finished.text
     assert "Workspace" in finished.text and "Recent" not in finished.text
+
+
+def test_stale_prepare_action_is_rejected_without_mutating_or_preparing():
+    store.catalog.tools = [{"name": "cache_tool", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "class_name": {"type": "string"}}, "required": ["query", "class_name"]}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/cache_tool")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    view = client.get(_links(view.text, "Set Workspace")[0], follow_redirects=True)
+    view = client.get(_links(view.text, "Set Folder")[1], follow_redirects=True)
+    old_prepare = _link(view.text, "Prepare Execution")
+    current = client.get(_links(view.text, "Set Workspace")[0], follow_redirects=True)
+    stale = client.get(old_prepare)
+    assert "STALE DRAFT VIEW" in stale.text
+    assert "Expected revision: 2" in stale.text and "Current revision: 3" in stale.text
+    assert not store.prepared
+    assert "Workspace" in current.text
+
+
+def test_prepared_invocation_keeps_snapshot_after_draft_changes_and_executes_once():
+    view = client.get(_start_string_draft().request.url)
+    view = client.get(_link(view.text, "Set Part"), follow_redirects=True)
+    view = _compose_via_visible_links(view, "WebControlledPart")
+    prepared = client.get(_link(view.text, "Prepare Execution"), follow_redirects=True)
+    prepare_id = re.search(r"PREPARE_ID: <code>([^<]+)", prepared.text).group(1)
+    assert "WebControlledPart" in prepared.text
+    changed = client.get(_link(view.text, "Open String Composer (name)"), follow_redirects=True)
+    changed = client.get(_link(changed.text, "Clear"), follow_redirects=True)
+    for char in "SomethingElse":
+        changed = client.get(_link(changed.text, f"Append {char}"), follow_redirects=True)
+    changed = client.get(_link(changed.text, "Finish"), follow_redirects=True)
+    assert "SomethingElse" in changed.text
+    prepared_again = client.get(f"/agent/prepared/{prepare_id}")
+    assert "WebControlledPart" in prepared_again.text and "SomethingElse" not in prepared_again.text
+    execute = _link(prepared_again.text, "Execute now")
+    first = client.get(execute, follow_redirects=False)
+    second = client.get(execute, follow_redirects=False)
+    assert first.headers["location"] == second.headers["location"]
+    request_id = re.search(r"REQUEST_ID: <code>([^<]+)", client.get(first.headers["location"]).text).group(1)
+    assert store.jobs[request_id].arguments["name"] == "WebControlledPart"
+
+
+def test_result_views_are_immutable_and_refresh_creates_new_snapshot():
+    view = client.get(_start_string_draft().request.url)
+    view = client.get(_link(view.text, "Set Part"), follow_redirects=True)
+    view = _compose_via_visible_links(view, "ResultSnapshot")
+    prepared = client.get(_link(view.text, "Prepare Execution"), follow_redirects=True)
+    result_one = client.get(_link(prepared.text, "Execute now"), follow_redirects=True)
+    result_one_id = re.search(r"RESULT_VIEW_ID: <code>([^<]+)", result_one.text).group(1)
+    request_id = re.search(r"REQUEST_ID: <code>([^<]+)", result_one.text).group(1)
+    assert "STATUS: pending" in result_one.text
+    store.complete(request_id, True, {"ok": True, "name": "ResultSnapshot"})
+    result_two = client.get(_link(result_one.text, "Refresh Result"), follow_redirects=True)
+    assert "STATUS: completed" in result_two.text
+    assert "STATUS: pending" in client.get(f"/agent/result-view/{result_one_id}").text

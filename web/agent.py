@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import asyncio
+import copy
+import hashlib
 import time
 from datetime import datetime, timezone
 from html import escape
@@ -51,7 +53,7 @@ STRING_CHARACTER_BY_TOKEN = dict(STRING_CHARACTERS)
 
 def agent_page(title: str, body: str) -> HTMLResponse:
     response = HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{escape(title)}</title><style>body{{font-family:system-ui,sans-serif;max-width:1000px;margin:30px auto;padding:0 18px;color:#172033}}a{{color:#0759b5;margin-right:12px}}pre{{white-space:pre-wrap;background:#f2f5f9;padding:14px;border-radius:8px}}.card{{border:1px solid #d9e0ea;padding:14px;margin:10px 0;border-radius:8px}}.missing{{color:#9a2c00}}code{{background:#eef2f7;padding:2px 4px}}</style></head><body>{body}</body></html>")
-    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
+    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "CDN-Cache-Control": "no-store", "Surrogate-Control": "no-store"})
     return response
 
 
@@ -88,6 +90,86 @@ def register_agent_routes(app, store, current_studio_connected):
 
     def missing(draft: dict[str, Any]) -> list[str]:
         return [name for name in required(draft["schema"]) if name not in draft["arguments"]]
+
+    def bump(draft: dict[str, Any]) -> None:
+        draft["revision"] = int(draft.get("revision", 0)) + 1
+        draft["last_access"] = now()
+
+    def make_view(draft: dict[str, Any]) -> str:
+        view_id = "V_" + uuid4().hex[:18]
+        arguments = copy.deepcopy(draft.get("arguments", {}))
+        snapshot = {
+            "view_id": view_id,
+            "draft_id": draft["draft_id"],
+            "revision": int(draft.get("revision", 0)),
+            "created_at": now(),
+            "arguments_snapshot": arguments,
+            "missing_arguments": [name for name in required(draft["schema"]) if name not in arguments],
+            "ready": not any(name for name in required(draft["schema"]) if name not in arguments),
+            "tool_name": draft["tool_name"],
+            "schema": copy.deepcopy(draft["schema"]),
+            "action_ids": {},
+        }
+        store.views[view_id] = snapshot
+        return view_id
+
+    def make_action(draft_id: str, expected_revision: int, operation: str, payload: dict[str, Any]) -> str:
+        action_id = "A_" + uuid4().hex[:18]
+        store.actions[action_id] = {
+            "action_id": action_id,
+            "draft_id": draft_id,
+            "expected_revision": expected_revision,
+            "operation": operation,
+            "payload": copy.deepcopy(payload),
+            "created_at": now(),
+            "consumed": False,
+            "resulting_view_id": None,
+        }
+        return f"/agent/action/{action_id}"
+
+    def action_link(draft_id: str, revision: int, operation: str, payload: dict[str, Any], label: str) -> str:
+        return href(make_action(draft_id, revision, operation, payload), label)
+
+    def view_action_link(view: dict[str, Any], operation: str, payload: dict[str, Any], label: str) -> str:
+        key = json.dumps([operation, payload], ensure_ascii=False, sort_keys=True, default=str)
+        action_id = view.setdefault("action_ids", {}).get(key)
+        if not action_id:
+            action_id = "A_" + uuid4().hex[:18]
+            store.actions[action_id] = {"action_id": action_id, "draft_id": view["draft_id"], "expected_revision": view["revision"], "operation": operation, "payload": copy.deepcopy(payload), "created_at": now(), "consumed": False, "resulting_url": None}
+            view["action_ids"][key] = action_id
+        return href(f"/agent/action/{action_id}", label)
+
+    def stale_page(action: dict[str, Any], draft: dict[str, Any]) -> HTMLResponse:
+        current = make_view(draft)
+        body = f"<h1>STALE DRAFT VIEW</h1><p>Expected revision: {action['expected_revision']}</p><p>Current revision: {draft.get('revision', 0)}</p><p>This action belongs to an older draft view and was NOT applied.</p><p>{href('/agent/view/' + current, 'Open Current Draft')}</p>"
+        return agent_page("Stale Draft View", body)
+
+    def snapshot_links(view: dict[str, Any], name: str, schema: dict[str, Any]) -> str:
+        draft_id = view["draft_id"]; revision = view["revision"]; encoded = quote(name, safe="")
+        links: list[str] = []
+        base = {"name": name}
+        if "enum" in schema:
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in schema["enum"]]
+        typ = schema_type(schema)
+        if typ == "string":
+            values = [schema.get("default"), "Workspace", "Part", "Folder", "Model", "Script", "Name", "Parent"] + list(reversed(store.recent_string_values))
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in values if value is not None]
+            links.append(view_action_link(view, "open_string", {"name": name, "view_id": view["view_id"]}, f"Open String Composer ({name})"))
+        elif typ == "boolean":
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {str(value).lower()}") for value in (True, False)]
+        elif typ in {"integer", "number"}:
+            values = [0, 1, -1, 10, 100, 0.5] if typ == "number" else [0, 1, -1, 10, 100]
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, str(value)) for value in values]
+        elif typ == "object" and name in {"values", "properties", "attributes"}:
+            links.append(view_action_link(view, "set_nested", {"name": name, "path": ["Anchored"], "value": True}, "Set Anchored=true"))
+        elif typ == "array" and name == "names":
+            links.append(view_action_link(view, "set_arg", {"name": name, "value": ["Anchored"]}, "Read Anchored"))
+        if name.lower() in {"ref", "parent", "target", "instance", "selection", "script", "object"} or typ == "object":
+            links.append(view_action_link(view, "open_picker", {"name": name, "view_id": view["view_id"]}, "Choose Roblox Instance"))
+        if nullable(schema):
+            links.append(view_action_link(view, "set_arg", {**base, "value": None}, "Set null"))
+        links.append(view_action_link(view, "clear", base, "Clear"))
+        return " ".join(links)
 
     def remember_string(value: str) -> None:
         if value and value in store.recent_string_values:
@@ -200,8 +282,152 @@ def register_agent_routes(app, store, current_studio_connected):
     async def agent_start(tool_name: str):
         tool = tool_or_404(tool_name)
         draft_id = "d_" + uuid4().hex[:16]
-        store.drafts[draft_id] = {"draft_id": draft_id, "tool_name": tool_name, "schema": tool.get("inputSchema", {}), "arguments": {}, "created_at": now(), "last_access": now(), "status": "draft", "executed": False, "request_id": None, "execution_token": None}
-        return RedirectResponse(f"/agent/draft/{draft_id}", status_code=303)
+        store.drafts[draft_id] = {"draft_id": draft_id, "revision": 0, "tool_name": tool_name, "schema": tool.get("inputSchema", {}), "arguments": {}, "created_at": now(), "last_access": now(), "status": "draft", "executed": False, "request_id": None, "execution_token": None}
+        view_id = make_view(store.drafts[draft_id])
+        return RedirectResponse(f"/agent/view/{view_id}", status_code=303)
+
+    @app.get("/agent/view/{view_id}", response_class=HTMLResponse)
+    async def agent_view(view_id: str):
+        view = store.views.get(view_id)
+        if not view:
+            raise HTTPException(404, "View not found or expired")
+        draft = draft_or_404(view["draft_id"])
+        fields = []
+        for name, schema in view["schema"].get("properties", {}).items():
+            value = view["arguments_snapshot"].get(name, "<missing>")
+            fields.append(f"<div class='card'><strong>{escape(name)}</strong> ({escape(schema_type(schema))})<br>value: <code>{escape(str(value))}</code><br>{snapshot_links(view, name, schema)}</div>")
+        prepare = action_link(view["draft_id"], view["revision"], "prepare", {}, "Prepare Execution") if view["ready"] else "Complete required arguments first"
+        body = f"<h1>Invocation View</h1><p>VIEW_ID: <code>{escape(view_id)}</code></p><p>DRAFT_ID: <code>{escape(view['draft_id'])}</code></p><p>DRAFT_REVISION: {view['revision']}</p><p>STATE: {escape('ready' if view['ready'] else 'draft')}</p><p>TOOL: {escape(view['tool_name'])}</p><p class='missing'>Missing required: {escape(', '.join(view['missing_arguments']) or 'none')}</p>{''.join(fields)}<h2>Arguments snapshot</h2><pre>{escape(json.dumps(view['arguments_snapshot'], ensure_ascii=False, indent=2))}</pre><p>{prepare} {href('/agent/tools', 'Tools')} {href('/agent', 'Agent Home')}</p>"
+        return agent_page("Invocation View", body)
+
+    @app.get("/agent/action/{action_id}", response_class=HTMLResponse)
+    async def agent_action(action_id: str):
+        action = store.actions.get(action_id)
+        if not action:
+            raise HTTPException(404, "Action not found or expired")
+        if action.get("consumed"):
+            target = action.get("resulting_url")
+            return RedirectResponse(target, status_code=303) if target else agent_page("Action complete", "<h1>Action already consumed</h1>")
+        draft = draft_or_404(action["draft_id"])
+        if action["operation"] not in {"execute_prepared", "refresh_result"} and int(action["expected_revision"]) != int(draft.get("revision", 0)):
+            return stale_page(action, draft)
+        operation = action["operation"]; payload = action["payload"]
+        if operation == "open_string":
+            view_id = payload.get("view_id") or make_view(draft)
+            target = f"/agent/string-view/{view_id}/{quote(payload['name'], safe='')}"
+        elif operation == "open_picker":
+            view_id = payload.get("view_id") or make_view(draft)
+            target = f"/agent/picker-view/{view_id}/{quote(payload['name'], safe='')}"
+        elif operation == "prepare":
+            arguments = copy.deepcopy(draft["arguments"])
+            canonical = json.dumps({"tool_name": draft["tool_name"], "arguments": arguments}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            prepare_id = "P_" + uuid4().hex[:18]
+            store.prepared[prepare_id] = {"prepare_id": prepare_id, "draft_id": draft["draft_id"], "draft_revision": draft["revision"], "tool_name": draft["tool_name"], "arguments_snapshot": arguments, "arguments_hash": hashlib.sha256(canonical.encode()).hexdigest(), "created_at": now(), "executed": False, "request_id": None, "execute_action_id": None}
+            target = f"/agent/prepared/{prepare_id}"
+        elif operation == "execute_prepared":
+            prepared = store.prepared.get(payload["prepare_id"])
+            if not prepared:
+                raise HTTPException(404, "Prepared invocation not found")
+            if prepared.get("executed"):
+                target = f"/agent/result-view/{prepared['result_view_id']}"
+            else:
+                request_id = "WEB_AGENT_" + uuid4().hex[:16]
+                store.create_job(Job(request_id=request_id, tool=prepared["tool_name"], arguments=copy.deepcopy(prepared["arguments_snapshot"])))
+                prepared.update({"executed": True, "request_id": request_id})
+                result_view_id = "R_" + uuid4().hex[:18]
+                prepared["result_view_id"] = result_view_id
+                store.result_views[result_view_id] = {"result_view_id": result_view_id, "request_id": request_id, "draft_id": prepared["draft_id"], "draft_revision": prepared["draft_revision"], "status": "pending", "result": None, "error": None, "created_at": now()}
+                target = f"/agent/result-view/{result_view_id}"
+        elif operation == "refresh_result":
+            old = store.result_views.get(payload["result_view_id"])
+            if not old:
+                raise HTTPException(404, "Result view not found")
+            job = store.jobs.get(old["request_id"])
+            status = job.status if job else old["status"]
+            result_view_id = "R_" + uuid4().hex[:18]
+            store.result_views[result_view_id] = {"result_view_id": result_view_id, "request_id": old["request_id"], "draft_id": old["draft_id"], "draft_revision": old["draft_revision"], "status": status, "result": copy.deepcopy(job.result) if job and status == "completed" else None, "error": copy.deepcopy(job.error) if job and status == "error" else None, "created_at": now()}
+            target = f"/agent/result-view/{result_view_id}"
+        else:
+            if operation == "set_arg":
+                draft["arguments"][payload["name"]] = copy.deepcopy(payload.get("value"))
+            elif operation == "append_string":
+                draft["arguments"][payload["name"]] = str(draft["arguments"].get(payload["name"], "")) + payload["character"]
+            elif operation == "backspace":
+                draft["arguments"][payload["name"]] = str(draft["arguments"].get(payload["name"], ""))[:-1]
+            elif operation == "clear":
+                draft["arguments"].pop(payload["name"], None)
+            elif operation == "set_nested":
+                draft["arguments"].setdefault(payload["name"], {})[payload["path"][-1]] = copy.deepcopy(payload["value"])
+            elif operation == "select_instance":
+                draft["arguments"][payload["name"]] = copy.deepcopy(payload["candidate"])
+            elif operation == "finish_string":
+                remember_string(str(draft["arguments"].get(payload["name"], "")))
+            else:
+                raise HTTPException(400, "Unknown action")
+            bump(draft)
+            next_view = make_view(draft)
+            if operation in {"append_string", "backspace", "clear"} and schema_type(draft["schema"].get("properties", {}).get(payload.get("name"), {})) == "string":
+                target = f"/agent/string-view/{next_view}/{quote(payload['name'], safe='')}"
+            else:
+                target = f"/agent/view/{next_view}"
+        action["consumed"] = True; action["resulting_url"] = target
+        return RedirectResponse(target, status_code=303)
+
+    @app.get("/agent/string-view/{view_id}/{name}", response_class=HTMLResponse)
+    async def string_view(view_id: str, name: str):
+        view = store.views.get(view_id)
+        if not view or name not in view["schema"].get("properties", {}):
+            raise HTTPException(404, "String view not found")
+        current = str(view["arguments_snapshot"].get(name, "")); base = f"/agent/string-view/{view_id}/{quote(name, safe='')}"
+        links = " ".join(view_action_link(view, "append_string", {"name": name, "character": char}, f"Append {char if char != ' ' else 'space'}") for token, char in STRING_CHARACTERS)
+        actions = " ".join([view_action_link(view, "backspace", {"name": name}, "Backspace"), view_action_link(view, "clear", {"name": name}, "Clear"), view_action_link(view, "finish_string", {"name": name}, "Finish"), href(f"/agent/view/{view_id}", "Back to Draft")])
+        body = f"<h1>String Composer</h1><p>VIEW_ID: <code>{escape(view_id)}</code></p><p>DRAFT_ID: <code>{escape(view['draft_id'])}</code></p><p>DRAFT_REVISION: {view['revision']}</p><p>ARGUMENT: <code>{escape(name)}</code></p><p>CURRENT VALUE: <code>{escape(current)}</code></p><p>{links}</p><p>{actions}</p>"
+        return agent_page("String Composer", body)
+
+    @app.get("/agent/picker-view/{view_id}/{name}", response_class=HTMLResponse)
+    async def picker_view(view_id: str, name: str):
+        view = store.views.get(view_id)
+        if not view:
+            raise HTTPException(404, "Picker view not found")
+        items = []
+        for candidate in store.recent_refs[-50:]:
+            candidate_url = view_action_link(view, "select_instance", {"name": name, "candidate": candidate}, "__candidate__")
+            label = str(candidate.get("name", candidate.get("ref", "candidate")))
+            if candidate.get("className"): label += f" ({candidate['className']})"
+            items.append(f"<li>{candidate_url.replace('>__candidate__</a>', '>' + escape(label) + '</a>')} — {escape(str(candidate.get('displayPath', candidate.get('ref', ''))))}</li>")
+        body = f"<h1>Roblox Instance Picker</h1><p>VIEW_ID: <code>{escape(view_id)}</code></p><p>DRAFT_ID: <code>{escape(view['draft_id'])}</code></p><p>DRAFT_REVISION: {view['revision']}</p><ul>{''.join(items) or '<li>No recent references yet. Run a read recipe first.</li>'}</ul>{href('/agent/view/' + view_id, 'Back to Draft')}"
+        return agent_page("Roblox Instance Picker", body)
+
+    @app.get("/agent/prepared/{prepare_id}", response_class=HTMLResponse)
+    async def prepared_view(prepare_id: str):
+        prepared = store.prepared.get(prepare_id)
+        if not prepared:
+            raise HTTPException(404, "Prepared invocation not found or expired")
+        if not prepared.get("execute_action_id"):
+            action_id = "A_" + uuid4().hex[:18]
+            store.actions[action_id] = {"action_id": action_id, "draft_id": prepared["draft_id"], "expected_revision": prepared["draft_revision"], "operation": "execute_prepared", "payload": {"prepare_id": prepare_id}, "created_at": now(), "consumed": False, "resulting_url": None}
+            prepared["execute_action_id"] = action_id
+        execute_href = href(f"/agent/action/{prepared['execute_action_id']}", "Execute now") if not prepared.get("executed") else href(f"/agent/result-view/{prepared['result_view_id']}", "Open Result")
+        body = f"<h1>Prepared Invocation</h1><p>PREPARE_ID: <code>{escape(prepare_id)}</code></p><p>DRAFT_ID: <code>{escape(prepared['draft_id'])}</code></p><p>DRAFT_REVISION: {prepared['draft_revision']}</p><p>STATE: {escape('executed' if prepared.get('executed') else 'prepared')}</p><p>TOOL: {escape(prepared['tool_name'])}</p><p>ARGUMENTS_SHA256: <code>{prepared['arguments_hash']}</code></p><pre>{escape(json.dumps(prepared['arguments_snapshot'], ensure_ascii=False, indent=2))}</pre><p>{execute_href} {href('/agent', 'Agent Home')}</p>"
+        return agent_page("Prepared Invocation", body)
+
+    @app.get("/agent/result-view/{result_view_id}", response_class=HTMLResponse)
+    async def result_view(result_view_id: str):
+        snapshot = store.result_views.get(result_view_id)
+        if not snapshot:
+            raise HTTPException(404, "Result view not found or expired")
+        if snapshot["status"] in {"pending", "running"}:
+            action_id = snapshot.get("refresh_action_id")
+            if not action_id:
+                action_id = "A_" + uuid4().hex[:18]
+                store.actions[action_id] = {"action_id": action_id, "draft_id": snapshot["draft_id"], "expected_revision": snapshot["draft_revision"], "operation": "refresh_result", "payload": {"result_view_id": result_view_id}, "created_at": now(), "consumed": False, "resulting_url": None}
+                snapshot["refresh_action_id"] = action_id
+            refresh = href(f"/agent/action/{action_id}", "Refresh Result")
+        else:
+            refresh = ""
+            collect_refs(snapshot.get("result"))
+        body = f"<h1>Agent Result View</h1><p>RESULT_VIEW_ID: <code>{escape(result_view_id)}</code></p><p>REQUEST_ID: <code>{escape(snapshot['request_id'])}</code></p><p>STATUS: {escape(snapshot['status'])}</p><p>VIEW_ID: <code>{escape(result_view_id)}</code></p><p>DRAFT_ID: <code>{escape(snapshot['draft_id'])}</code></p><p>DRAFT_REVISION: {snapshot['draft_revision']}</p><pre>{escape(json.dumps(snapshot.get('result') if snapshot['status'] == 'completed' else snapshot.get('error'), ensure_ascii=False, indent=2, default=str))}</pre><p>{refresh} {href('/agent', 'Agent Home')}</p>"
+        return agent_page("Agent Result View", body)
 
     @app.get("/agent/draft/{draft_id}", response_class=HTMLResponse)
     async def agent_draft(draft_id: str):
