@@ -24,6 +24,8 @@ run_relay.bat
 
 Después ejecuta `run_relay.bat` o `python -m local.relay_client`.
 
+Si queda un relay oculto ejecutándose, usa `stop_relay.bat`. Este archivo cierra únicamente procesos `local.relay_client`; no cierra Roblox Studio ni el bridge MCP.
+
 ## Despliegue
 
 Sube únicamente `web/` a Render siguiendo [web/README_DEPLOY.md](web/README_DEPLOY.md). Copia la URL resultante a `config.json` y comprueba `/api/v1/health.json`, luego `/api/v1/catalog.json`.
