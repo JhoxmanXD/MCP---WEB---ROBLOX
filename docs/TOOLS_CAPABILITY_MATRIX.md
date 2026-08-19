@@ -13,11 +13,21 @@ Fuente: `MCP tools/list` del bridge local. El gateway no hardcodea handlers; cad
 | Output/history | `studio_get_output`, `output`, `studio_clear_output_buffer`, `studio_undo`, `undo`, `studio_redo`, `redo`, `studio_can_undo`, `studio_can_redo` | Completa para defaults/lecturas; acciones de escritura requieren confirmación humana |
 | Playtest | `studio_playtest`, `playtest` | Parcial: enum `action` se puede navegar, pero requiere validación del estado real |
 
+## Familias semánticas y aliases
+
+El catálogo actual contiene 71 nombres MCP que representan 38 familias semánticas. El agrupamiento se basa en la pareja canónica/alias del schema y en el prefijo `studio_`; no elimina ningún nombre invocable.
+
+Las familias prácticas prioritarias son: sesiones, estado, place, árbol, selección, búsqueda, inspección de instancia, propiedades, atributos, tags, servicios, creación, renombrado, reparent, clonación, lectura de scripts, apertura de scripts, output e historial. Las familias condicionales son las que requieren source grande, patches con hash, valores Roblox estructurados, batches o acciones de playtest. No hay familias artificialmente bloqueadas por el número de aliases.
+
 ## Cobertura medida tras el navigator genérico
 
 - Total descubierto: 71.
-- Protocol navigable: 71/71; todas tienen página de schema, draft y ruta de ejecución genérica.
-- Practical for ChatGPT Web: 23/71 con argumentos vacíos o primitivos simples; 48/71 son parciales por refs, objects/arrays complejos o texto grande.
+- MCP names: 71.
+- Capability families: 38.
+- Protocol navigable names: 71/71; todas tienen página de schema, draft y ruta de ejecución genérica.
+- Practical capability families: 19/38 para workflows normales de lectura y edición acotada.
+- Conditional capability families: 19/38 cuando requieren source grande, valores estructurados, batch o estado especial.
+- La métrica anterior por nombre (`23/71`) se conserva solo como referencia histórica; los aliases ya no inflan la cobertura semántica.
 - Blocked: 0 por nombre. Una tool puede quedar `Not ready` si el usuario no proporciona un valor complejo válido.
 
 La matriz es deliberadamente honesta: listar y describir una tool es dinámico para las 71; representar cómodamente cada schema complejo y seleccionar refs reales requiere ampliar el selector de Studio.

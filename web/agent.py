@@ -94,12 +94,26 @@ def register_agent_routes(app, store, current_studio_connected):
             await asyncio.sleep(0.25)
         return store.jobs[request_id].model_dump(mode="json")
 
+    def candidate_from(value: dict[str, Any]) -> dict[str, Any] | None:
+        if not (value.get("ref") or value.get("path")):
+            return None
+        candidate = {key: value[key] for key in ("ref", "name", "className", "childCount", "session_id") if key in value}
+        raw_path = value.get("path")
+        if isinstance(raw_path, list) and all(isinstance(part, str) and part for part in raw_path):
+            candidate["path"] = raw_path
+            candidate["displayPath"] = ".".join(raw_path)
+        elif isinstance(raw_path, str) and raw_path:
+            candidate["displayPath"] = raw_path
+            candidate["path"] = [part for part in raw_path.split(".") if part]
+        return candidate or None
+
     def collect_refs(value: Any) -> None:
         if isinstance(value, dict):
-            if value.get("ref") or value.get("path"):
-                candidate = {key: value[key] for key in ("ref", "path", "name", "className", "childCount") if key in value}
+            candidate = candidate_from(value)
+            if candidate:
                 if candidate and candidate not in store.recent_refs:
                     store.recent_refs.append(candidate)
+                    del store.recent_refs[:-100]
             for child in value.values(): collect_refs(child)
         elif isinstance(value, list):
             for child in value: collect_refs(child)
@@ -117,6 +131,8 @@ def register_agent_routes(app, store, current_studio_connected):
                 links.append(href(base + quick_object, "Set Anchored=true"))
         elif typ == "array":
             links.append(href(f"/agent/draft/{draft['draft_id']}/arg/{quote(name, safe='')}/array", "Edit array"))
+            if name == "names":
+                links.append(href(base + quote(json.dumps(["Anchored"]), safe=''), "Read Anchored"))
         elif typ == "boolean":
             links += [href(base + "true", "Set true"), href(base + "false", "Set false")]
         elif typ in {"integer", "number"}:
@@ -125,6 +141,8 @@ def register_agent_routes(app, store, current_studio_connected):
             links.append(href(f"/agent/draft/{draft['draft_id']}/arg/{quote(name, safe='')}/number", "Number composer"))
         elif typ == "string":
             values = [schema.get("default"), "Workspace", "Part", "Folder", "Model", "Script", "Name", "Parent"]
+            if name in {"name", "query"}:
+                values += ["MCP_WEB_CHAIN_TEST", "MCP_WEB_CHAIN_TEST_RENAMED"]
             links += [href(base + quote(json.dumps(value), safe=''), f"Set {value}") for value in values if value is not None]
             links += [href(f"/agent/draft/{draft['draft_id']}/arg/{quote(name, safe='')}/token/{quote(token, safe='')}", f"Append {token}") for token in ["a", "b", "0", "_", ".", "/"]]
         if name.lower() in {"ref", "parent", "target", "instance", "selection", "script", "object"} or typ == "object":
@@ -328,6 +346,8 @@ def register_agent_routes(app, store, current_studio_connected):
     async def agent_result(request_id: str):
         job = store.jobs.get(request_id)
         if not job: return agent_page("Result Not Found", f"<h1>Result not found</h1><p>{escape(request_id)}</p>{href('/agent', 'Agent Home')}")
+        if job.status == "completed":
+            collect_refs(job.result)
         refresh = href(f"/agent/result/{request_id}", "Refresh Result") if job.status in {"pending", "running"} else ""
         body = f"<h1>Agent Result</h1><p>REQUEST_ID: <code>{escape(request_id)}</code></p><p>TOOL: {escape(job.tool)}</p><p>STATUS: {escape(job.status)}</p><p>created_at: {escape(job.created_at)}<br>started_at: {escape(str(job.started_at))}<br>completed_at: {escape(str(job.completed_at))}</p><pre>{escape(json.dumps(job.result if job.status == 'completed' else job.error, ensure_ascii=False, indent=2, default=str))}</pre><p>{refresh} {href('/agent', 'Agent Home')} {href('/agent/latest', 'Latest')}</p>"
         return agent_page("Agent Result", body)

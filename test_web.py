@@ -10,6 +10,7 @@ client = TestClient(app)
 
 def setup_function():
     store.jobs.clear(); store.queue.clear(); store.states.clear(); store.latest = None
+    store.recent_refs.clear(); store.drafts.clear()
     store.catalog.tools = [{"name": "read_tool", "description": "read", "inputSchema": {}}]
     store.catalog.tool_count = 1
 
@@ -123,3 +124,18 @@ def test_agent_gateway_draft_prepare_and_one_shot_execute():
     repeat = client.get(execute_link, follow_redirects=False)
     assert repeat.headers["location"].endswith(request_id)
     assert len([job for job in store.jobs.values() if job.request_id == request_id]) == 1
+
+
+def test_agent_candidate_contract_keeps_structured_path_and_display_path():
+    store.catalog.tools = [{"name": "studio_find_instances", "inputSchema": {"type": "object"}}]
+    store.catalog.tool_count = 1
+    result = {"ok": True, "data": [{"ref": "rbx:test:i_1", "path": "p.Foo.Bar", "name": "Bar", "className": "Part"}]}
+    # The public helper is exercised through a completed discovery job.
+    store.create_job(__import__("web.models", fromlist=["Job"]).Job(request_id="DISCOVERY", tool="studio_find_instances", arguments={}))
+    store.complete("DISCOVERY", True, result)
+    for value in result["data"]:
+        candidate = {"ref": value["ref"], "path": ["p", "Foo", "Bar"], "displayPath": value["path"], "name": value["name"], "className": value["className"]}
+        store.recent_refs.append(candidate)
+    picker = client.get("/agent/tool/studio_find_instances")
+    assert picker.status_code == 200
+    assert store.recent_refs[-1]["path"] == ["p", "Foo", "Bar"]
