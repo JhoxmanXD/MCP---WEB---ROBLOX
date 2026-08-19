@@ -98,7 +98,7 @@ def register_agent_routes(app, store, current_studio_connected):
         draft["revision"] = int(draft.get("revision", 0)) + 1
         draft["last_access"] = now()
 
-    def make_view(draft: dict[str, Any]) -> str:
+    def create_agent_view(draft: dict[str, Any]) -> str:
         view_id = "V_" + uuid4().hex[:18]
         arguments = copy.deepcopy(draft.get("arguments", {}))
         snapshot = {
@@ -143,7 +143,7 @@ def register_agent_routes(app, store, current_studio_connected):
         return href(f"/agent/action/{action_id}", label)
 
     def stale_page(action: dict[str, Any], draft: dict[str, Any]) -> HTMLResponse:
-        current = make_view(draft)
+        current = create_agent_view(draft)
         body = f"<h1>STALE DRAFT VIEW</h1><p>Expected revision: {action['expected_revision']}</p><p>Current revision: {draft.get('revision', 0)}</p><p>This action belongs to an older draft view and was NOT applied.</p><p>{href('/agent/view/' + current, 'Open Current Draft')}</p>"
         return agent_page("Stale Draft View", body)
 
@@ -286,7 +286,7 @@ def register_agent_routes(app, store, current_studio_connected):
         tool = tool_or_404(tool_name)
         draft_id = "d_" + uuid4().hex[:16]
         store.drafts[draft_id] = {"draft_id": draft_id, "revision": 0, "tool_name": tool_name, "schema": tool.get("inputSchema", {}), "arguments": {}, "created_at": now(), "last_access": now(), "status": "draft", "executed": False, "request_id": None, "execution_token": None}
-        view_id = make_view(store.drafts[draft_id])
+        view_id = create_agent_view(store.drafts[draft_id])
         return RedirectResponse(f"/agent/view/{view_id}", status_code=303)
 
     @app.get("/agent/view/{view_id}", response_class=HTMLResponse)
@@ -316,10 +316,10 @@ def register_agent_routes(app, store, current_studio_connected):
             return stale_page(action, draft)
         operation = action["operation"]; payload = action["payload"]
         if operation == "open_string":
-            view_id = payload.get("view_id") or make_view(draft)
+            view_id = payload.get("view_id") or create_agent_view(draft)
             target = f"/agent/string-view/{view_id}/{quote(payload['name'], safe='')}"
         elif operation == "open_picker":
-            view_id = payload.get("view_id") or make_view(draft)
+            view_id = payload.get("view_id") or create_agent_view(draft)
             target = f"/agent/picker-view/{view_id}/{quote(payload['name'], safe='')}"
         elif operation == "prepare":
             arguments = copy.deepcopy(draft["arguments"])
@@ -368,7 +368,7 @@ def register_agent_routes(app, store, current_studio_connected):
             else:
                 raise HTTPException(400, "Unknown action")
             bump(draft)
-            next_view = make_view(draft)
+            next_view = create_agent_view(draft)
             if operation in {"append_string", "backspace", "clear"} and schema_type(draft["schema"].get("properties", {}).get(payload.get("name"), {})) == "string":
                 target = f"/agent/string-view/{next_view}/{quote(payload['name'], safe='')}"
             else:
