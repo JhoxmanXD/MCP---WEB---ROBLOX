@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import os
+from html import escape
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
@@ -22,6 +24,7 @@ app = FastAPI(title="MCP-WEB", version="0.1.0")
 store = MemoryStore()
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+READ_WAIT_SECONDS = 8.0
 
 
 def no_cache(response: JSONResponse) -> JSONResponse:
@@ -33,9 +36,75 @@ def payload(value: Any) -> JSONResponse:
     return no_cache(JSONResponse(value))
 
 
+def html_page(title: str, body: str) -> HTMLResponse:
+    response = HTMLResponse(f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{escape(title)}</title><style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 20px;line-height:1.5;color:#172033}}a{{color:#0759b5}}pre{{white-space:pre-wrap;background:#f2f5f9;padding:16px;border-radius:8px}}li{{margin:4px 0}}</style></head><body>{body}</body></html>")
+    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
+    return response
+
+
+def text_value(value: Any) -> str:
+    return escape(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
 @app.get("/")
 async def dashboard() -> FileResponse:
     return FileResponse(STATIC / "index.html")
+
+
+@app.get("/read/health", response_class=HTMLResponse)
+async def read_health() -> HTMLResponse:
+    heartbeat = store.heartbeat
+    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected)).lower()}</p><p><strong>studio_connected:</strong> {str(store.catalog.studio_connected).lower()}</p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    return html_page("MCP-WEB Health", body)
+
+
+@app.get("/read/catalog", response_class=HTMLResponse)
+async def read_catalog() -> HTMLResponse:
+    catalog_data = store.catalog.model_dump(mode="json")
+    items = "".join(f"<li><code>{escape(str(tool.get('name', '')))}</code> — {escape(str(tool.get('description', '')))}</li>" for tool in catalog_data["tools"])
+    body = f"<h1>MCP-WEB LIVE CATALOG</h1><p><strong>server_instance_id:</strong> <code>{escape(catalog_data['server_instance_id'])}</code></p><p><strong>catalog_generation:</strong> {catalog_data['catalog_generation']}</p><p><strong>updated_at:</strong> {escape(catalog_data['updated_at'])}</p><p><strong>studio_connected:</strong> {str(catalog_data['studio_connected']).lower()}</p><p><strong>tool_count:</strong> {catalog_data['tool_count']}</p><h2>Tools</h2><ol>{items}</ol><p><a href='/'>Home</a> · <a href='/read/health'>Live Health</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    return html_page("MCP-WEB Live Catalog", body)
+
+
+@app.get("/read/sessions", response_class=HTMLResponse)
+async def read_sessions() -> HTMLResponse:
+    announced = {item.get("name") for item in store.catalog.tools if isinstance(item, dict)}
+    if "studio_list_sessions" not in announced:
+        return html_page("MCP-WEB Sessions", "<h1>MCP-WEB READ SESSIONS</h1><p>studio_list_sessions no está disponible en el catálogo actual.</p><p><a href='/read/catalog'>Live Catalog</a></p>")
+    request_id = f"WEB_READ_{uuid4().hex[:12]}"
+    store.create_job(Job(request_id=request_id, tool="studio_list_sessions", arguments={}))
+    deadline = asyncio.get_running_loop().time() + READ_WAIT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        job = store.jobs[request_id]
+        if job.status in {"completed", "error"}:
+            return _read_result_page(job)
+        await asyncio.sleep(0.25)
+    job = store.jobs[request_id]
+    return _read_result_page(job)
+
+
+def _read_result_page(job: Job) -> HTMLResponse:
+    refresh = f"<a href='/read/result/{escape(job.request_id)}'>Refresh result</a>"
+    result = f"<pre>{text_value(job.result if job.status == 'completed' else job.error)}</pre>" if job.status in {"completed", "error"} else "<p>El relay aún no ha completado el job.</p>"
+    body = f"<h1>MCP-WEB READ SESSIONS</h1><p><strong>request_id:</strong> <code>{escape(job.request_id)}</code></p><p><strong>status:</strong> {escape(job.status)}</p>{result}<p>{refresh} · <a href='/read/sessions'>New read</a> · <a href='/'>Home</a></p>"
+    return html_page("MCP-WEB Sessions Result", body)
+
+
+@app.get("/read/result/{request_id}", response_class=HTMLResponse)
+async def read_result(request_id: str) -> HTMLResponse:
+    job = store.jobs.get(request_id)
+    if not job:
+        return html_page("MCP-WEB Result", f"<h1>Result not found</h1><p>request_id: <code>{escape(request_id)}</code></p><p><a href='/read/sessions'>Read Studio Sessions</a></p>")
+    return _read_result_page(job)
+
+
+@app.get("/read/latest", response_class=HTMLResponse)
+async def read_latest() -> HTMLResponse:
+    if not store.latest:
+        return html_page("MCP-WEB Latest", "<h1>MCP-WEB LATEST RESULT</h1><p>No completed job yet.</p><p><a href='/'>Home</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>")
+    latest = store.latest
+    body = f"<h1>MCP-WEB LATEST RESULT</h1><p><strong>request_id:</strong> <code>{escape(str(latest.get('request_id')))}</code></p><p><strong>tool:</strong> {escape(str(latest.get('tool')))}</p><p><strong>status:</strong> {escape(str(latest.get('status')))}</p><p><strong>completed_at:</strong> {escape(str(latest.get('completed_at')))}</p><pre>{text_value(latest.get('result') if latest.get('status') == 'completed' else latest.get('error'))}</pre><p><a href='/'>Home</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    return html_page("MCP-WEB Latest Result", body)
 
 
 @app.get("/api/v1/health")

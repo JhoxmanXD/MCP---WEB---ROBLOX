@@ -61,3 +61,30 @@ def test_heartbeat_reports_missing_catalog():
     response = client.post("/api/v1/client/heartbeat", json={"client": "test", "tool_count": 1, "mcp_connected": True, "studio_connected": True})
     assert response.json()["catalog_present"] is False
     assert response.json()["catalog_tool_count"] == 0
+
+
+def test_navigable_read_routes_and_no_cache(monkeypatch):
+    from web import app as app_module
+    monkeypatch.setattr(app_module, "READ_WAIT_SECONDS", 0.01)
+    store.catalog.tools.append({"name": "studio_list_sessions", "description": "list sessions"})
+    store.catalog.tool_count = len(store.catalog.tools)
+    home = client.get("/")
+    assert "/read/health" in home.text
+    assert "/read/catalog" in home.text
+    assert "/read/sessions" in home.text
+    assert "/read/latest" in home.text
+    for path in ("/read/health", "/read/catalog", "/read/sessions", "/read/latest"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["cache-control"].startswith("no-store")
+    sessions = client.get("/read/sessions")
+    assert "request_id:" in sessions.text
+    assert "Refresh result" in sessions.text
+
+
+def test_read_result_does_not_create_job():
+    from web import app as app_module
+    before = len(store.jobs)
+    response = client.get("/read/result/UNKNOWN_READ_ID")
+    assert response.status_code == 200
+    assert len(store.jobs) == before
