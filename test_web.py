@@ -38,3 +38,17 @@ def test_unannounced_tool_rejected():
 def test_catalog_and_empty_poll():
     assert client.get("/api/v1/catalog.json").json()["tool_count"] == 1
     assert client.get("/api/v1/jobs/next").json() == {"job": None}
+
+
+def test_heartbeat_reports_catalog_presence():
+    response = client.post("/api/v1/client/heartbeat", json={"client": "test", "tool_count": 1, "mcp_connected": True, "studio_connected": True})
+    assert response.json()["catalog_present"] is True
+    assert response.json()["catalog_tool_count"] == 1
+
+
+def test_heartbeat_reports_missing_catalog():
+    store.catalog.tools = []
+    store.catalog.tool_count = 0
+    response = client.post("/api/v1/client/heartbeat", json={"client": "test", "tool_count": 1, "mcp_connected": True, "studio_connected": True})
+    assert response.json()["catalog_present"] is False
+    assert response.json()["catalog_tool_count"] == 0

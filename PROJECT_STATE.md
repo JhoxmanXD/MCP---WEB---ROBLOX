@@ -10,6 +10,7 @@
 - Configuración, batch de arranque, README y tests.
 - `config.json` actualizado al deploy real `https://mcp-web-roblox.onrender.com`.
 - `run_relay.bat` comprueba el puerto MCP 8787 y arranca el bridge existente si hace falta.
+- El heartbeat devuelve `catalog_present` y `catalog_tool_count`; el cliente republica el catálogo solo cuando falta o está incompleto.
 
 ## TESTED
 
@@ -18,6 +19,7 @@
 - Smoke test con `uvicorn app:app --host 127.0.0.1 --port 8999`: health respondió HTTP 200 y headers no-cache.
 - Render real: `/api/v1/health.json` HTTP 200 y `/` HTTP 200.
 - Render recibió heartbeat: `local_client_online=true`, `mcp_connected=true`, `studio_connected=true`, `tool_count=71`.
+- Tests de recuperación de catálogo: catálogo existente no se reenvía; catálogo ausente se restaura; fallo temporal no termina el cliente.
 - Catálogo público: 71 tools e incluye `studio_list_sessions`.
 
 ## REAL MCP TEST

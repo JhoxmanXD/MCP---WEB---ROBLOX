@@ -17,6 +17,21 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def catalog_needs_repair(heartbeat: dict, tool_count: int) -> bool:
+    return heartbeat.get("catalog_present") is not True or heartbeat.get("catalog_tool_count") != tool_count
+
+
+def restore_catalog_if_needed(relay: RelayWebClient, tools: list[dict], heartbeat: dict) -> bool:
+    if not catalog_needs_repair(heartbeat, len(tools)):
+        return False
+    try:
+        relay.catalog(tools, True)
+        return True
+    except Exception as exc:
+        log.warning("[WEB] Catalog upload failed; retrying: %s", exc)
+        return False
+
+
 async def run() -> None:
     config = load_config()
     relay = RelayWebClient(config["relay_url"])
@@ -25,6 +40,7 @@ async def run() -> None:
     mcp_url = config.get("mcp_url", "http://127.0.0.1:8787/mcp")
     log.info("[MCP-WEB] Starting...")
     adapter = None
+    tools: list[dict] = []
     try:
         while True:
             try:
@@ -33,9 +49,9 @@ async def run() -> None:
                     adapter = await connect_with_backoff(mcp_url)
                     tools = await adapter.list_tools()
                     log.info("[MCP] Connected — %d tools discovered", len(tools))
-                    relay.catalog(tools, True)
-                    log.info("[WEB] Catalog uploaded")
-                relay.heartbeat({"client": client_name, "mcp_connected": True, "studio_connected": True, "tool_count": len(tools), "timestamp": iso_now()})
+                heartbeat = relay.heartbeat({"client": client_name, "mcp_connected": True, "studio_connected": True, "tool_count": len(tools), "timestamp": iso_now()})
+                if await asyncio.to_thread(restore_catalog_if_needed, relay, tools, heartbeat):
+                    log.info("[WEB] Catalog uploaded/restored (%d tools)", len(tools))
                 job = await asyncio.to_thread(relay.next_job)
                 if job:
                     started = time.monotonic()

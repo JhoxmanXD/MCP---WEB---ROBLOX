@@ -65,7 +65,12 @@ async def upload_catalog(body: dict[str, Any]) -> JSONResponse:
 async def heartbeat(body: Heartbeat) -> JSONResponse:
     store.heartbeat = body
     store.catalog.studio_connected = body.studio_connected
-    return payload({"ok": True, "local_client_online": True})
+    return payload({
+        "ok": True,
+        "local_client_online": True,
+        "catalog_present": bool(store.catalog.tools),
+        "catalog_tool_count": store.catalog.tool_count,
+    })
 
 
 @app.get("/api/v1/call/{tool_name}")
