@@ -40,6 +40,14 @@ def test_catalog_and_empty_poll():
     assert client.get("/api/v1/jobs/next").json() == {"job": None}
 
 
+def test_catalog_generation_and_timestamp_change_on_republish():
+    first = client.post("/api/v1/catalog", json={"tools": [{"name": "read_tool"}], "studio_connected": True}).json()
+    second = client.post("/api/v1/catalog", json={"tools": [{"name": "read_tool"}], "studio_connected": True}).json()
+    assert first["server_instance_id"] == second["server_instance_id"]
+    assert second["catalog_generation"] == first["catalog_generation"] + 1
+    assert second["updated_at"] != first["updated_at"]
+
+
 def test_heartbeat_reports_catalog_presence():
     response = client.post("/api/v1/client/heartbeat", json={"client": "test", "tool_count": 1, "mcp_connected": True, "studio_connected": True})
     assert response.json()["catalog_present"] is True

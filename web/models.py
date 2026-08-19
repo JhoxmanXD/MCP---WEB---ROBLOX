@@ -26,6 +26,8 @@ class Job(BaseModel):
 
 
 class Catalog(BaseModel):
+    server_instance_id: str = ""
+    catalog_generation: int = 0
     updated_at: str = Field(default_factory=now_iso)
     studio_connected: bool = False
     tool_count: int = 0

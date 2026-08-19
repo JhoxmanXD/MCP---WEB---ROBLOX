@@ -54,10 +54,7 @@ async def upload_catalog(body: dict[str, Any]) -> JSONResponse:
     tools = body.get("tools", [])
     if not isinstance(tools, list):
         raise HTTPException(400, "tools must be a list")
-    values = {"studio_connected": bool(body.get("studio_connected")), "tool_count": len(tools), "tools": tools}
-    if body.get("updated_at"):
-        values["updated_at"] = body["updated_at"]
-    store.catalog = Catalog(**values)
+    store.replace_catalog(tools, bool(body.get("studio_connected")), body.get("updated_at"))
     return payload(store.catalog.model_dump(mode="json"))
 
 
@@ -125,4 +122,4 @@ async def state(state_key: str) -> JSONResponse:
 
 @app.get("/api/v1/dashboard.json")
 async def dashboard_data() -> JSONResponse:
-    return payload({"health": True, "local_client_online": store.online(), "studio_connected": store.catalog.studio_connected, "tool_count": store.catalog.tool_count, "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
+    return payload({"health": True, "local_client_online": store.online(), "studio_connected": store.catalog.studio_connected, "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
