@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
@@ -25,6 +26,31 @@ from uuid import uuid4
 AGENT_STATE_SCHEMA_VERSION = "agent-state-v1"
 AGENT_STATE_DEFAULT_NAMESPACE = "mcp-web:agent:immutable-v1"
 logger = logging.getLogger("mcp-web.agent_state")
+
+
+_active_request: ContextVar[Any | None] = ContextVar("agent_state_request", default=None)
+
+
+def _lock_context(store: Any, request_context: dict[str, Any] | None) -> dict[str, str]:
+    request_context = request_context or {}
+    action_id = str(request_context.get("action_id") or "none")
+    action = getattr(store, "actions", {}).get(action_id) if action_id != "none" else None
+    return {
+        "request_id": str(request_context.get("request_id") or "unknown"),
+        "action_id": action_id,
+        "operation": str((action or {}).get("operation") or request_context.get("operation") or "unknown"),
+        "process": str(os.getpid()),
+        "instance": str(os.getenv("RENDER_INSTANCE_ID", "unknown")),
+    }
+
+
+def _lock_log(level: int, event: str, context: dict[str, str], wait_ms: int = 0, held_ms: int = 0, reason: str = "request") -> None:
+    logger.log(
+        level,
+        "%s request_id=%s action_id=%s operation=%s process=%s instance=%s wait_ms=%s held_ms=%s reason=%s",
+        event, context["request_id"], context["action_id"], context["operation"],
+        context["process"], context["instance"], wait_ms, held_ms, reason,
+    )
 
 
 @dataclass(frozen=True)
@@ -168,6 +194,60 @@ def _clear_publication_audit(store: Any) -> None:
         pending.clear()
 
 
+class _AgentStateRequest:
+    """A request lease that can be released while waiting on external I/O."""
+
+    def __init__(self, backend: "AgentStateStore", store: Any, request_context: dict[str, Any] | None) -> None:
+        self.backend = backend
+        self.store = store
+        self.context = _lock_context(store, request_context)
+        self.suspended = False
+        self.lock_started: float | None = None
+
+    async def suspend(self, reason: str) -> None:
+        if self.suspended:
+            return
+        await self.backend._suspend(self, reason)
+        self.suspended = True
+
+    async def resume(self, reason: str) -> None:
+        if not self.suspended:
+            return
+        await self.backend._resume(self, reason)
+        self.suspended = False
+
+    async def refresh(self, reason: str) -> None:
+        await self.backend._refresh(self, reason)
+
+
+@asynccontextmanager
+async def agent_state_external_io(reason: str = "external_io") -> AsyncIterator[None]:
+    """Run an external wait without holding the shared Agent State lock."""
+    request = _active_request.get()
+    if request is None:
+        yield
+        return
+    await request.suspend(reason)
+    try:
+        yield
+    finally:
+        # If the caller was cancelled while waiting, the durable pending state
+        # is already safe and the lock is already released.  A normal return
+        # reacquires the lease so the route can finish its mutation atomically.
+        if request.suspended:
+            try:
+                await request.resume(reason)
+            except asyncio.CancelledError:
+                # Do not turn a client disconnect into a leaked Redis lease.
+                request.suspended = True
+
+
+async def refresh_agent_state_for_io(reason: str = "external_io_poll") -> None:
+    request = _active_request.get()
+    if request is not None and request.suspended:
+        await request.refresh(reason)
+
+
 class AgentStateStore:
     mode = "unknown"
     shared = False
@@ -187,8 +267,17 @@ class AgentStateStore:
         return {"phase": phase, "state_key_exists": None, "ttl": None, "drafts": None, "views": None, "actions": None}
 
     @asynccontextmanager
-    async def request(self, store: Any) -> AsyncIterator[None]:
+    async def request(self, store: Any, request_context: dict[str, Any] | None = None) -> AsyncIterator[None]:
         raise NotImplementedError
+
+    async def _suspend(self, request: _AgentStateRequest, reason: str) -> None:
+        return None
+
+    async def _resume(self, request: _AgentStateRequest, reason: str) -> None:
+        return None
+
+    async def _refresh(self, request: _AgentStateRequest, reason: str) -> None:
+        return None
 
 
 class InMemoryAgentStateStore(AgentStateStore):
@@ -207,9 +296,14 @@ class InMemoryAgentStateStore(AgentStateStore):
         }
 
     @asynccontextmanager
-    async def request(self, store: Any) -> AsyncIterator[None]:
+    async def request(self, store: Any, request_context: dict[str, Any] | None = None) -> AsyncIterator[None]:
         _clear_publication_audit(store)
-        yield
+        request = _AgentStateRequest(self, store, request_context)
+        token = _active_request.set(request)
+        try:
+            yield
+        finally:
+            _active_request.reset(token)
 
 
 class InMemorySharedAgentStateStore(AgentStateStore):
@@ -236,17 +330,56 @@ class InMemorySharedAgentStateStore(AgentStateStore):
         }
 
     @asynccontextmanager
-    async def request(self, store: Any) -> AsyncIterator[None]:
-        async with self._lock:
+    async def request(self, store: Any, request_context: dict[str, Any] | None = None) -> AsyncIterator[None]:
+        request = _AgentStateRequest(self, store, request_context)
+        await self._lock.acquire()
+        entered = False
+        token = None
+        try:
             _clear_publication_audit(store)
-            version = self._load_into(store)
-            try:
-                yield
+            request.version = self._load_into(store)
+            request.lock_started = time.monotonic()
+            _lock_log(logging.WARNING, "AGENT_LOCK_ACQUIRED", request.context, reason="request")
+            token = _active_request.set(request)
+            entered = True
+            yield
+            if entered and not request.suspended:
                 state = bounded_agent_state(store.export_agent_state())
                 _verify_published_actions(state, set(getattr(store, "pending_agent_action_ids", set())))
-                self._save_from(store, version)
-            finally:
-                pass
+                self._save_from(store, request.version)
+        finally:
+            if not request.suspended:
+                if request.lock_started is not None:
+                    held_ms = int((time.monotonic() - request.lock_started) * 1000)
+                    _lock_log(logging.WARNING, "AGENT_LOCK_RELEASED", request.context, held_ms=held_ms, reason="request")
+                self._lock.release()
+            if token is not None:
+                _active_request.reset(token)
+
+    async def _suspend(self, request: _AgentStateRequest, reason: str) -> None:
+        state = bounded_agent_state(request.store.export_agent_state())
+        _verify_published_actions(state, set(getattr(request.store, "pending_agent_action_ids", set())))
+        self._save_from(request.store, request.version)
+        held_ms = int((time.monotonic() - request.lock_started) * 1000)
+        _lock_log(logging.WARNING, "AGENT_LOCK_RELEASED", request.context, held_ms=held_ms, reason=reason)
+        request.lock_started = None
+        self._lock.release()
+
+    async def _resume(self, request: _AgentStateRequest, reason: str) -> None:
+        started = time.monotonic()
+        _lock_log(logging.WARNING, "AGENT_LOCK_WAIT", request.context, reason=reason)
+        await self._lock.acquire()
+        try:
+            request.version = self._load_into(request.store)
+            request.lock_started = time.monotonic()
+            _lock_log(logging.WARNING, "AGENT_LOCK_ACQUIRED", request.context, wait_ms=int((time.monotonic() - started) * 1000), reason=reason)
+        except BaseException:
+            self._lock.release()
+            raise
+
+    async def _refresh(self, request: _AgentStateRequest, reason: str) -> None:
+        async with self._lock:
+            self._load_into(request.store)
 
     def _load_into(self, store: Any) -> int:
         if self._document is None:
@@ -381,12 +514,16 @@ class SharedAgentStateStore(AgentStateStore):
         )
         return values
 
-    async def _acquire(self, redis: Any) -> str:
+    async def _acquire(self, redis: Any, context: dict[str, str], reason: str = "request") -> tuple[str, int]:
         token = uuid4().hex
+        started = time.monotonic()
+        _lock_log(logging.WARNING, "AGENT_LOCK_WAIT", context, reason=reason)
         deadline = time.monotonic() + float(os.getenv("AGENT_STATE_LOCK_WAIT_SECONDS", "5"))
         while time.monotonic() < deadline:
             if await redis.set(self.lock_key, token, nx=True, ex=self.lock_seconds):
-                return token
+                wait_ms = int((time.monotonic() - started) * 1000)
+                _lock_log(logging.WARNING, "AGENT_LOCK_ACQUIRED", context, wait_ms=wait_ms, reason=reason)
+                return token, wait_ms
             await asyncio.sleep(0.1)
         raise AgentStateBackendUnavailable("timed out acquiring shared Agent state lock")
 
@@ -458,16 +595,64 @@ class SharedAgentStateStore(AgentStateStore):
             raise AgentStateBackendUnavailable("shared Agent state write failed") from exc
 
     @asynccontextmanager
-    async def request(self, store: Any) -> AsyncIterator[None]:
+    async def request(self, store: Any, request_context: dict[str, Any] | None = None) -> AsyncIterator[None]:
         redis = await self._client()
-        token = await self._acquire(redis)
+        request = _AgentStateRequest(self, store, request_context)
+        token, _wait_ms = await self._acquire(redis, request.context)
+        request.redis = redis
+        request.token = token
+        request.version = None
+        request.lock_started = time.monotonic()
+        entered = False
+        context_token = None
         try:
             _clear_publication_audit(store)
-            revision = await self._load(redis, store)
+            request.version = await self._load(redis, store)
+            context_token = _active_request.set(request)
+            entered = True
             yield
-            await self._save(redis, store, revision)
         finally:
-            await self._release(redis, token)
+            try:
+                if entered and not request.suspended:
+                    await self._save(redis, store, request.version)
+            finally:
+                if not request.suspended:
+                    if request.lock_started is not None:
+                        held_ms = int((time.monotonic() - request.lock_started) * 1000)
+                        _lock_log(logging.WARNING, "AGENT_LOCK_RELEASED", request.context, held_ms=held_ms, reason="request")
+                    await self._release(redis, request.token)
+                if context_token is not None:
+                    _active_request.reset(context_token)
+
+    async def _suspend(self, request: _AgentStateRequest, reason: str) -> None:
+        await self._save(request.redis, request.store, request.version)
+        held_ms = int((time.monotonic() - request.lock_started) * 1000)
+        _lock_log(logging.WARNING, "AGENT_LOCK_RELEASED", request.context, held_ms=held_ms, reason=reason)
+        await self._release(request.redis, request.token)
+        request.lock_started = None
+
+    async def _resume(self, request: _AgentStateRequest, reason: str) -> None:
+        token = None
+        try:
+            token, wait_ms = await self._acquire(request.redis, request.context, reason=reason)
+            request.token = token
+            request.version = await self._load(request.redis, request.store)
+            request.lock_started = time.monotonic()
+            _lock_log(logging.WARNING, "AGENT_LOCK_ACQUIRED", request.context, wait_ms=wait_ms, reason=reason)
+        except BaseException:
+            if token is not None:
+                await self._release(request.redis, token)
+            raise
+
+    async def _refresh(self, request: _AgentStateRequest, reason: str) -> None:
+        token, wait_ms = await self._acquire(request.redis, request.context, reason=reason)
+        started = time.monotonic()
+        try:
+            await self._load(request.redis, request.store)
+        finally:
+            held_ms = int((time.monotonic() - started) * 1000)
+            _lock_log(logging.WARNING, "AGENT_LOCK_RELEASED", request.context, held_ms=held_ms, reason=reason)
+            await self._release(request.redis, token)
 
 
 def _new_document(state: dict[str, Any], revision: int, namespace: str) -> dict[str, Any]:

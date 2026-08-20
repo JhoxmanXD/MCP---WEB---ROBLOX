@@ -70,7 +70,14 @@ async def shared_agent_state(request: Request, call_next):
     if not is_workflow_request or not agent_state_backend.shared:
         return await call_next(request)
     try:
-        async with agent_state_backend.request(store):
+        path_parts = path.split("/")
+        action_id = path_parts[3] if len(path_parts) > 3 and path_parts[2] == "action" else "none"
+        request_context = {
+            "request_id": request.headers.get("x-request-id", "unknown"),
+            "action_id": action_id,
+            "operation": "unknown",
+        }
+        async with agent_state_backend.request(store, request_context=request_context):
             return await call_next(request)
     except AgentStateBackendUnavailable as exc:
         return _agent_state_error_response(503, "AGENT STATE BACKEND UNAVAILABLE", str(exc))

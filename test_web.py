@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from web.app import app, store
-from web.agent_state import AgentStateBackendUnavailable, InMemorySharedAgentStateBackend, RedisAgentStateBackend, key_for_action, key_for_draft, key_for_editor, key_for_prepared, key_for_result, key_for_view
+from web.agent_state import AgentStateBackendUnavailable, InMemorySharedAgentStateBackend, RedisAgentStateBackend, agent_state_external_io, key_for_action, key_for_draft, key_for_editor, key_for_prepared, key_for_result, key_for_view
 from web.store import MemoryStore
 
 
@@ -404,6 +404,90 @@ def test_shared_agent_state_serializes_prepared_execution_once():
 
         results = await asyncio.gather(execute(MemoryStore()), execute(MemoryStore()))
         assert results == ["WEB_AGENT_SHARED_ONCE", "WEB_AGENT_SHARED_ONCE"]
+
+    asyncio.run(scenario())
+
+
+def test_shared_lock_is_released_during_external_discovery(caplog):
+    backend = InMemorySharedAgentStateBackend("test:external-io")
+    holder_store = MemoryStore()
+    unrelated_store = MemoryStore()
+    released = asyncio.Event()
+    unrelated_completed = asyncio.Event()
+
+    async def unrelated_request():
+        await released.wait()
+        async with backend.request(unrelated_store, {"request_id": "unrelated"}):
+            unrelated_completed.set()
+
+    async def holder_request():
+        async with backend.request(holder_store, {"request_id": "slow-discovery"}):
+            async with agent_state_external_io("slow_discovery"):
+                released.set()
+                await asyncio.wait_for(unrelated_completed.wait(), timeout=0.25)
+
+    async def scenario():
+        await asyncio.gather(holder_request(), unrelated_request())
+
+    caplog.set_level("WARNING", logger="mcp-web.agent_state")
+    asyncio.run(scenario())
+    assert "AGENT_LOCK_RELEASED" in caplog.text
+    assert "reason=slow_discovery" in caplog.text
+
+
+def test_pending_discovery_survives_client_disconnect_for_single_action_replay():
+    from web.models import Job
+
+    backend = InMemorySharedAgentStateBackend("test:disconnect-replay")
+    first = MemoryStore()
+    second = MemoryStore()
+    draft = {"draft_id": "d_replay", "revision": 0}
+    view = {"view_id": "V_replay", "draft_id": "d_replay", "revision": 0}
+    action = {
+        "action_id": "A_replay", "draft_id": "d_replay", "view_id": "V_replay",
+        "expected_revision": 0, "operation": "open_editor", "payload": {},
+        "consumed": False, "created_at": "now", "expires_at": "2099-01-01T00:00:00+00:00",
+        "state_schema_version": "agent-state-v1", "pending_external_io": True,
+        "discovery_request_id": "WEB_AGENT_DISCOVER_replay",
+    }
+
+    async def seed_state():
+        async with backend.request(first):
+            first.drafts[draft["draft_id"]] = draft
+            first.views[view["view_id"]] = view
+            first.actions[action["action_id"]] = action
+            first.jobs[action["discovery_request_id"]] = Job(
+                request_id=action["discovery_request_id"], tool="studio_get_properties", arguments={"class_name": "Part"},
+            )
+            first.pending_agent_action_ids.add(action["action_id"])
+
+    async def scenario():
+        await seed_state()
+
+        async def cancelled_client():
+            async with backend.request(MemoryStore(), {"request_id": "client-a", "action_id": "A_replay"}):
+                async with agent_state_external_io("client_disconnect"):
+                    await asyncio.sleep(10)
+
+        task = asyncio.create_task(cancelled_client())
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        async with backend.request(second, {"request_id": "client-b", "action_id": "A_replay"}):
+            second.jobs[action["discovery_request_id"]].status = "completed"
+            second.jobs[action["discovery_request_id"]].result = {"structuredContent": {"data": {"propertyMetadata": {}}}}
+            second.actions["A_replay"]["pending_external_io"] = False
+            second.actions["A_replay"]["consumed"] = True
+            second.actions["A_replay"]["resulting_url"] = "/agent/view/V_next"
+            second.pending_agent_action_ids.add("A_replay")
+
+        replay = MemoryStore()
+        async with backend.request(replay, {"request_id": "client-c", "action_id": "A_replay"}):
+            assert replay.actions["A_replay"]["consumed"] is True
+            assert replay.actions["A_replay"]["resulting_url"] == "/agent/view/V_next"
+            assert len([job for job in replay.jobs.values() if job.tool == "studio_get_properties"]) == 1
 
     asyncio.run(scenario())
 

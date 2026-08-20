@@ -19,9 +19,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 try:
     from .models import Job
     from .build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
+    from .agent_state import agent_state_external_io, refresh_agent_state_for_io
 except ImportError:  # Render runs `uvicorn app:app` from web/
     from models import Job
     from build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
+    from agent_state import agent_state_external_io, refresh_agent_state_for_io
 
 
 def now() -> str:
@@ -636,25 +638,70 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             store.recent_string_values.append(value)
             del store.recent_string_values[:-12]
 
-    async def discover(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    def same_discovery_job(job: Job, tool_name: str, arguments: dict[str, Any]) -> bool:
+        return job.tool == tool_name and isinstance(job.arguments, dict) and job.arguments == arguments
+
+    async def discover(tool_name: str, arguments: dict[str, Any], action: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if tool_name not in catalog_tools():
             return None
-        request_id = "WEB_AGENT_DISCOVER_" + uuid4().hex[:12]
-        store.create_job(Job(request_id=request_id, tool=tool_name, arguments=arguments))
-        deadline = asyncio.get_running_loop().time() + DISCOVERY_WAIT_SECONDS
-        while asyncio.get_running_loop().time() < deadline:
-            job = store.jobs.get(request_id)
-            if job is None:
-                return {"request_id": request_id, "tool": tool_name, "status": "error", "error": {"message": "discovery job state was refreshed before completion"}}
-            if job.status in {"completed", "error"}:
-                if job.status == "completed":
-                    collect_refs(job.result)
-                return job.model_dump(mode="json")
-            await asyncio.sleep(0.25)
-        job = store.jobs.get(request_id)
-        if job is None:
-            return {"request_id": request_id, "tool": tool_name, "status": "error", "error": {"message": "discovery job state was refreshed before timeout"}}
-        return job.model_dump(mode="json")
+        existing = next((job for job in reversed(list(store.jobs.values())) if same_discovery_job(job, tool_name, arguments) and (
+            job.status == "completed" or (
+                action is not None and action.get("discovery_request_id") == job.request_id and job.status in {"pending", "running"}
+            )
+        )), None)
+        job = existing or store.create_job(Job(request_id="WEB_AGENT_DISCOVER_" + uuid4().hex[:12], tool=tool_name, arguments=copy.deepcopy(arguments)))
+        request_id = job.request_id
+        if action is not None:
+            action.update({
+                "pending_external_io": job.status not in {"completed", "error"},
+                "pending_operation": "discover",
+                "discovery_tool": tool_name,
+                "discovery_request_id": request_id,
+                "discovery_arguments": copy.deepcopy(arguments),
+            })
+        logger.warning(
+            "AGENT_DISCOVER_START request_id=%s tool=%s action_id=%s status=%s",
+            request_id, tool_name, (action or {}).get("action_id", "none"), job.status,
+        )
+        if job.status in {"completed", "error"}:
+            if job.status == "completed":
+                collect_refs(job.result)
+            if action is not None:
+                action["pending_external_io"] = False
+            logger.warning(
+                "AGENT_DISCOVER_RESULT request_id=%s tool=%s action_id=%s status=%s",
+                request_id, tool_name, (action or {}).get("action_id", "none"), job.status,
+            )
+            return job.model_dump(mode="json")
+
+        # Persist the pending job/action before releasing the Agent State lock.
+        # Relay/Studio polling must never run inside the shared-state lease.
+        result: dict[str, Any]
+        async with agent_state_external_io(f"discover:{tool_name}"):
+            deadline = asyncio.get_running_loop().time() + DISCOVERY_WAIT_SECONDS
+            while asyncio.get_running_loop().time() < deadline:
+                await refresh_agent_state_for_io(f"discover_poll:{tool_name}")
+                job = store.jobs.get(request_id)
+                if job is None:
+                    result = {"request_id": request_id, "tool": tool_name, "status": "error", "error": {"message": "discovery job state was refreshed before completion"}}
+                    break
+                if job.status in {"completed", "error"}:
+                    if job.status == "completed":
+                        collect_refs(job.result)
+                    result = job.model_dump(mode="json")
+                    break
+                await asyncio.sleep(0.25)
+            else:
+                await refresh_agent_state_for_io(f"discover_timeout:{tool_name}")
+                job = store.jobs.get(request_id)
+                result = job.model_dump(mode="json") if job is not None else {"request_id": request_id, "tool": tool_name, "status": "error", "error": {"message": "discovery job state was refreshed before timeout"}}
+        if action is not None:
+            action["pending_external_io"] = False
+        logger.warning(
+            "AGENT_DISCOVER_RESULT request_id=%s tool=%s action_id=%s status=%s",
+            request_id, tool_name, (action or {}).get("action_id", "none"), result.get("status", "unknown"),
+        )
+        return result
 
     def result_data(result: Any) -> Any:
         if not isinstance(result, dict):
@@ -722,7 +769,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 break
         return current if isinstance(current, dict) else {}
 
-    async def resolve_property_schemas(draft: dict[str, Any], object_path: list[Any], names: list[str]) -> dict[str, dict[str, Any]]:
+    async def resolve_property_schemas(draft: dict[str, Any], object_path: list[Any], names: list[str], action: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
         if not names:
             return {}
         cache = draft.setdefault("property_metadata", {})
@@ -783,7 +830,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             else:
                 request["class_name"] = context["class_name"]
             live_discovery_attempted = tool_name in catalog_tools()
-            job = await discover(tool_name, request) if live_discovery_attempted else None
+            job = await discover(tool_name, request, action) if live_discovery_attempted else None
             data = result_data(job.get("result")) if isinstance(job, dict) and job.get("status") == "completed" else None
             if isinstance(data, dict):
                 metadata = data.get("propertyMetadata") or data.get("property_metadata") or {}
@@ -804,7 +851,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                     {"query": "", "limit": 1},
                 ]
                 for sample_request in sample_requests:
-                    sample_job = await discover("studio_find_instances", sample_request)
+                    sample_job = await discover("studio_find_instances", sample_request, action)
                     samples = result_data(sample_job.get("result")) if isinstance(sample_job, dict) and sample_job.get("status") == "completed" else None
                     if not (isinstance(samples, list) and samples and isinstance(samples[0], dict)):
                         continue
@@ -819,7 +866,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                         sample_ref = {"path": sample["path"]}
                     if sample_ref is None:
                         continue
-                    sample_properties = await discover("studio_get_properties", {"ref": sample_ref, "names": missing_names})
+                    sample_properties = await discover("studio_get_properties", {"ref": sample_ref, "names": missing_names}, action)
                     sample_data = result_data(sample_properties.get("result")) if isinstance(sample_properties, dict) and sample_properties.get("status") == "completed" else None
                     if isinstance(sample_data, dict):
                         metadata = sample_data.get("propertyMetadata") or sample_data.get("property_metadata") or {}
@@ -992,6 +1039,17 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             target = action.get("resulting_url")
             logger.info("ACTION_REPLAY action_id=%s operation=%s resulting_url=%s method=%s request_id=%s user_agent=%s referer=%s", action_id, action.get("operation"), target or "none", request_info["method"], request_info["request_id"], request_info["user_agent"], request_info["referer"])
             return agent_redirect(target) if target else agent_page("Action complete", "<h1>Action already consumed</h1>")
+        if action.get("pending_external_io"):
+            pending_job = store.jobs.get(action.get("discovery_request_id"))
+            if pending_job is not None and pending_job.status in {"pending", "running"}:
+                return agent_page(
+                    "Discovery pending",
+                    f"<h1>Discovery pending</h1><p>request_id: <code>{escape(str(pending_job.request_id))}</code></p>"
+                    f"<p>{href('/agent/action/' + quote(action_id, safe=''), 'Refresh')}</p>",
+                )
+            # A completed job is safe to replay through the normal resolver;
+            # a missing job is recovered by creating one durable replacement.
+            action["pending_external_io"] = False
         try:
             draft = draft_or_404(action["draft_id"])
         except HTTPException as exc:
@@ -1030,7 +1088,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                     if roblox_type(property_schema) == "EnumItem" and not (property_schema.get("enum_values") or property_schema.get("enumValues")):
                         unresolved_names.append(str(key))
                 if unresolved_names:
-                    property_schemas.update(await resolve_property_schemas(draft, editor_path, unresolved_names))
+                    property_schemas.update(await resolve_property_schemas(draft, editor_path, unresolved_names, action))
             target = create_editor(source_view, editor_path, payload.get("kind", roblox_type(editor_schema or {}) or "value"), editor_schema, property_schemas, payload.get("parent_schema"))
         elif operation == "editor_open_key":
             editor = store.editors.get(payload.get("editor_id"))
@@ -1059,7 +1117,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 target = create_editor(store.views[editor["view_id"]], editor["path"], "object", editor.get("parent_schema"), editor.get("property_schemas"))
             else:
                 path_set(draft["arguments"], editor["path"] + [key], None)
-                property_schemas = await resolve_property_schemas(draft, editor["path"], [key])
+                property_schemas = await resolve_property_schemas(draft, editor["path"], [key], action)
                 if key in property_schemas:
                     path_set(draft["arguments"], editor["path"] + [key], default_for_schema(property_schemas[key]))
                 advance_revision(draft, operation, action, arguments_hash_before)

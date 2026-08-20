@@ -98,14 +98,24 @@ class MemoryStore:
             self.catalog = Catalog(**state.get("catalog", {}))
             heartbeat = state.get("heartbeat")
             self.heartbeat = Heartbeat(**heartbeat) if heartbeat else None
-            self.drafts = deepcopy(state.get("drafts", {}))
-            self.recent_refs = deepcopy(state.get("recent_refs", []))
-            self.recent_string_values = deepcopy(state.get("recent_string_values", []))
-            self.views = deepcopy(state.get("views", {}))
-            self.actions = deepcopy(state.get("actions", {}))
-            self.prepared = deepcopy(state.get("prepared", {}))
-            self.result_views = deepcopy(state.get("result_views", {}))
-            self.editors = deepcopy(state.get("editors", {}))
+            # Keep record object identities stable while a route is suspended
+            # for external I/O.  The resumed route may still hold references
+            # to its draft/action/view, so replacing the dictionaries wholesale
+            # would make it mutate stale records after the shared state reload.
+            for name in ("drafts", "views", "actions", "prepared", "result_views", "editors"):
+                target = getattr(self, name)
+                incoming = state.get(name, {})
+                for key in list(target):
+                    if key not in incoming:
+                        del target[key]
+                for key, value in incoming.items():
+                    if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                        target[key].clear()
+                        target[key].update(deepcopy(value))
+                    else:
+                        target[key] = deepcopy(value)
+            self.recent_refs[:] = deepcopy(state.get("recent_refs", []))
+            self.recent_string_values[:] = deepcopy(state.get("recent_string_values", []))
 
     def create_job(self, job: Job) -> Job:
         with self.lock:
