@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 from uuid import uuid4
@@ -20,6 +22,47 @@ from uuid import uuid4
 
 AGENT_STATE_SCHEMA_VERSION = "agent-state-v1"
 AGENT_STATE_DEFAULT_NAMESPACE = "mcp-web:agent:immutable-v1"
+logger = logging.getLogger("mcp-web.agent_state")
+
+
+@dataclass(frozen=True)
+class StateLocator:
+    """The physical Redis key plus the JSON record path inside it."""
+
+    redis_key: str
+    record_path: tuple[str, str]
+
+
+def state_key_for(namespace: str) -> str:
+    return f"{namespace}:state"
+
+
+def _locator(namespace: str, collection: str, record_id: str) -> StateLocator:
+    return StateLocator(state_key_for(namespace), (collection, str(record_id)))
+
+
+def key_for_draft(namespace: str, draft_id: str) -> StateLocator:
+    return _locator(namespace, "drafts", draft_id)
+
+
+def key_for_view(namespace: str, view_id: str) -> StateLocator:
+    return _locator(namespace, "views", view_id)
+
+
+def key_for_action(namespace: str, action_id: str) -> StateLocator:
+    return _locator(namespace, "actions", action_id)
+
+
+def key_for_editor(namespace: str, editor_id: str) -> StateLocator:
+    return _locator(namespace, "editors", editor_id)
+
+
+def key_for_prepared(namespace: str, prepare_id: str) -> StateLocator:
+    return _locator(namespace, "prepared", prepare_id)
+
+
+def key_for_result(namespace: str, result_view_id: str) -> StateLocator:
+    return _locator(namespace, "result_views", result_view_id)
 
 
 class AgentStateBackendError(RuntimeError):
@@ -83,6 +126,46 @@ def bounded_agent_state(state: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _verify_published_actions(state: dict[str, Any], action_ids: set[str]) -> None:
+    """Fail before response publication if rendered links are not durable."""
+    actions = state.get("actions", {})
+    drafts = state.get("drafts", {})
+    views = state.get("views", {})
+    editors = state.get("editors", {})
+    prepared = state.get("prepared", {})
+    result_views = state.get("result_views", {})
+    for action_id in action_ids:
+        action = actions.get(action_id)
+        if not isinstance(action, dict):
+            raise AgentStateBackendUnavailable(f"action {action_id} was not durably persisted")
+        required = ("action_id", "draft_id", "expected_revision", "operation", "payload", "consumed", "created_at", "expires_at", "state_schema_version")
+        if any(field not in action for field in required):
+            raise AgentStateIncompatible(f"action {action_id} record is incomplete")
+        if action["state_schema_version"] != AGENT_STATE_SCHEMA_VERSION:
+            raise AgentStateIncompatible(f"action {action_id} schema version is incompatible")
+        draft_id = action.get("draft_id")
+        if draft_id not in drafts:
+            raise AgentStateBackendUnavailable(f"action {action_id} owner draft is not durable")
+        owner_view = action.get("view_id")
+        if owner_view and owner_view not in views:
+            raise AgentStateBackendUnavailable(f"action {action_id} owner view is not durable")
+        owner_editor = action.get("editor_id")
+        if owner_editor and owner_editor not in editors:
+            raise AgentStateBackendUnavailable(f"action {action_id} owner editor is not durable")
+        owner_prepared = action.get("prepared_id") or action.get("payload", {}).get("prepare_id")
+        if owner_prepared and owner_prepared not in prepared:
+            raise AgentStateBackendUnavailable(f"action {action_id} owner prepared state is not durable")
+        owner_result = action.get("result_view_id") or action.get("payload", {}).get("result_view_id")
+        if owner_result and owner_result not in result_views:
+            raise AgentStateBackendUnavailable(f"action {action_id} owner result view is not durable")
+
+
+def _clear_publication_audit(store: Any) -> None:
+    pending = getattr(store, "pending_agent_action_ids", None)
+    if pending is not None:
+        pending.clear()
+
+
 class AgentStateStore:
     mode = "unknown"
     shared = False
@@ -94,6 +177,9 @@ class AgentStateStore:
             "connected": False,
             "schema_version": AGENT_STATE_SCHEMA_VERSION,
         }
+
+    async def roundtrip(self) -> bool:
+        return bool(self.status().get("connected"))
 
     @asynccontextmanager
     async def request(self, store: Any) -> AsyncIterator[None]:
@@ -111,10 +197,13 @@ class InMemoryAgentStateStore(AgentStateStore):
             "connected": True,
             "schema_version": AGENT_STATE_SCHEMA_VERSION,
             "namespace": "process-local",
+            "state_key": "process-local",
+            "roundtrip": True,
         }
 
     @asynccontextmanager
     async def request(self, store: Any) -> AsyncIterator[None]:
+        _clear_publication_audit(store)
         yield
 
 
@@ -128,6 +217,7 @@ class InMemorySharedAgentStateStore(AgentStateStore):
         self.namespace = namespace
         self._document: dict[str, Any] | None = None
         self._lock = asyncio.Lock()
+        self._roundtrip = True
 
     def status(self) -> dict[str, Any]:
         return {
@@ -136,14 +226,19 @@ class InMemorySharedAgentStateStore(AgentStateStore):
             "connected": True,
             "schema_version": AGENT_STATE_SCHEMA_VERSION,
             "namespace": self.namespace,
+            "state_key": f"{self.namespace}:state",
+            "roundtrip": self._roundtrip,
         }
 
     @asynccontextmanager
     async def request(self, store: Any) -> AsyncIterator[None]:
         async with self._lock:
+            _clear_publication_audit(store)
             version = self._load_into(store)
             try:
                 yield
+                state = bounded_agent_state(store.export_agent_state())
+                _verify_published_actions(state, set(getattr(store, "pending_agent_action_ids", set())))
                 self._save_from(store, version)
             finally:
                 pass
@@ -168,11 +263,12 @@ class SharedAgentStateStore(AgentStateStore):
         self.namespace = namespace
         self.ttl_seconds = ttl_seconds
         self.lock_seconds = lock_seconds
-        self.key = f"{namespace}:state"
+        self.key = state_key_for(namespace)
         self.lock_key = f"{namespace}:lock"
         self._redis: Any = None
         self._last_error: str | None = None
         self._configured = bool(url)
+        self._roundtrip: bool | None = None
 
     def status(self) -> dict[str, Any]:
         result = {
@@ -182,7 +278,9 @@ class SharedAgentStateStore(AgentStateStore):
             "configured": self._configured,
             "schema_version": AGENT_STATE_SCHEMA_VERSION,
             "namespace": self.namespace,
+            "state_key": self.key,
             "ttl_seconds": self.ttl_seconds,
+            "roundtrip": self._roundtrip,
         }
         if self._last_error:
             result["error"] = self._last_error
@@ -205,6 +303,22 @@ class SharedAgentStateStore(AgentStateStore):
         self._last_error = None
         return self._redis
 
+    async def roundtrip(self) -> bool:
+        try:
+            redis = await self._client()
+            key = f"{self.namespace}:diagnostic:{uuid4().hex}"
+            token = uuid4().hex
+            await redis.set(key, token, ex=10)
+            result = await redis.get(key)
+            await redis.delete(key)
+            self._roundtrip = result == token
+        except AgentStateBackendError:
+            self._roundtrip = False
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._roundtrip = False
+        return bool(self._roundtrip)
+
     async def _acquire(self, redis: Any) -> str:
         token = uuid4().hex
         deadline = time.monotonic() + float(os.getenv("AGENT_STATE_LOCK_WAIT_SECONDS", "5"))
@@ -225,7 +339,12 @@ class SharedAgentStateStore(AgentStateStore):
     async def _load(self, redis: Any, store: Any) -> int:
         raw = await redis.get(self.key)
         if not raw:
+            store.agent_state_observed_ttl = -2
             return 0
+        redis_ttl = await redis.ttl(self.key)
+        store.agent_state_observed_ttl = redis_ttl
+        if redis_ttl <= 0:
+            raise AgentStateBackendUnavailable(f"shared state key has invalid TTL {redis_ttl}")
         try:
             document = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -252,6 +371,21 @@ class SharedAgentStateStore(AgentStateStore):
                 pipe.multi()
                 pipe.set(self.key, json.dumps(document, ensure_ascii=False, separators=(",", ":")), ex=self.ttl_seconds)
                 await pipe.execute()
+            persisted_raw = await redis.get(self.key)
+            persisted = json.loads(persisted_raw) if persisted_raw else None
+            _validate_document(persisted)
+            _verify_published_actions(persisted["state"], set(getattr(store, "pending_agent_action_ids", set())))
+            redis_ttl = await redis.ttl(self.key)
+            if redis_ttl <= 0:
+                raise AgentStateBackendUnavailable(f"shared state key has invalid TTL {redis_ttl}")
+            for action_id in getattr(store, "pending_agent_action_ids", set()):
+                logger.info(
+                    "ACTION_PERSISTED action_id=%s redis_key=%s record_path=%s/%s redis_ttl=%s persisted=true namespace=%s process_id=%s instance_id=%s store_id=%s",
+                    action_id, key_for_action(self.namespace, action_id).redis_key,
+                    *key_for_action(self.namespace, action_id).record_path, redis_ttl, self.namespace,
+                    os.getpid(), os.getenv("RENDER_INSTANCE_ID", "unknown"),
+                    getattr(store, "server_instance_id", "unknown"),
+                )
         except AgentStateBackendError:
             raise
         except Exception as exc:
@@ -263,6 +397,7 @@ class SharedAgentStateStore(AgentStateStore):
         redis = await self._client()
         token = await self._acquire(redis)
         try:
+            _clear_publication_audit(store)
             revision = await self._load(redis, store)
             yield
             await self._save(redis, store, revision)

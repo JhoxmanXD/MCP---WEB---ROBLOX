@@ -1,10 +1,11 @@
 import asyncio
 import re
 
+import pytest
 from fastapi.testclient import TestClient
 
 from web.app import app, store
-from web.agent_state import InMemorySharedAgentStateBackend, RedisAgentStateBackend
+from web.agent_state import AgentStateBackendUnavailable, InMemorySharedAgentStateBackend, RedisAgentStateBackend, key_for_action, key_for_draft, key_for_editor, key_for_prepared, key_for_result, key_for_view
 from web.store import MemoryStore
 
 
@@ -14,6 +15,7 @@ client = TestClient(app)
 def setup_function():
     store.jobs.clear(); store.queue.clear(); store.states.clear(); store.latest = None
     store.recent_refs.clear(); store.recent_string_values.clear(); store.drafts.clear(); store.views.clear(); store.actions.clear(); store.prepared.clear(); store.result_views.clear(); store.editors.clear()
+    store.pending_agent_action_ids.clear()
     store.catalog.tools = [{"name": "read_tool", "description": "read", "inputSchema": {}}]
     store.catalog.tool_count = 1
 
@@ -24,6 +26,7 @@ def test_health_and_no_cache():
     assert response.json()["service"] == "MCP-WEB"
     assert response.json()["agent_state_backend"] == "memory"
     assert response.json()["agent_state_backend_connected"] is True
+    assert response.json()["agent_state_roundtrip"] is True
     assert response.headers["cache-control"].startswith("no-store")
 
 
@@ -62,6 +65,53 @@ def test_shared_agent_state_survives_restart_and_alternating_clients():
     asyncio.run(scenario())
 
 
+def test_all_agent_entity_locators_use_same_physical_namespace_key():
+    namespace = "mcp-web:agent:immutable-v1"
+    locators = [
+        key_for_draft(namespace, "d_1"), key_for_view(namespace, "V_1"),
+        key_for_action(namespace, "A_1"), key_for_editor(namespace, "E_1"),
+        key_for_prepared(namespace, "P_1"), key_for_result(namespace, "R_1"),
+    ]
+    assert {locator.redis_key for locator in locators} == {f"{namespace}:state"}
+    assert [locator.record_path for locator in locators] == [
+        ("drafts", "d_1"), ("views", "V_1"), ("actions", "A_1"),
+        ("editors", "E_1"), ("prepared", "P_1"), ("result_views", "R_1"),
+    ]
+
+
+def test_shared_publication_rejects_action_not_durable():
+    backend = InMemorySharedAgentStateBackend("test:publication")
+    worker = MemoryStore()
+
+    async def actual():
+        async with backend.request(worker):
+            worker.drafts["d_publish"] = {"draft_id": "d_publish"}
+            worker.views["V_publish"] = {"view_id": "V_publish", "draft_id": "d_publish"}
+            worker.actions["A_publish"] = {"action_id": "A_publish", "draft_id": "d_publish", "view_id": "V_publish", "expected_revision": 0, "operation": "prepare", "payload": {}, "consumed": False, "created_at": "now", "expires_at": "2099-01-01T00:00:00+00:00", "state_schema_version": "agent-state-v1"}
+            worker.pending_agent_action_ids.add("A_publish")
+        with pytest.raises(AgentStateBackendUnavailable, match="A_missing"):
+            async with backend.request(worker):
+                worker.pending_agent_action_ids.add("A_missing")
+
+    asyncio.run(actual())
+
+
+def test_shared_http_view_publishes_resolvable_action_before_response(monkeypatch):
+    import web.app as app_module
+
+    backend = InMemorySharedAgentStateBackend("test:http-publication")
+    monkeypatch.setattr(app_module, "agent_state_backend", backend)
+    store.catalog.tools = [{"name": "read_tool", "description": "read", "inputSchema": {}}]
+    store.catalog.tool_count = 1
+    start = client.get("/agent/tool/read_tool/start", follow_redirects=False)
+    assert start.status_code == 303
+    view = client.get(start.headers["location"])
+    action_id = re.search(r"/agent/action/(A_[a-f0-9]+)", view.text).group(1)
+    action = client.get(f"/agent/action/{action_id}", follow_redirects=False)
+    assert action.status_code == 303
+    assert action.headers["location"].startswith("/agent/prepared/P_")
+
+
 def test_shared_agent_state_serializes_one_shot_action_consumption():
     backend = InMemorySharedAgentStateBackend("test:one-shot")
     seed = MemoryStore()
@@ -81,6 +131,30 @@ def test_shared_agent_state_serializes_one_shot_action_consumption():
 
         results = await asyncio.gather(consume(MemoryStore()), consume(MemoryStore()))
         assert sorted(results) == [False, True]
+
+    asyncio.run(scenario())
+
+
+def test_shared_agent_state_serializes_prepared_execution_once():
+    backend = InMemorySharedAgentStateBackend("test:prepared-once")
+    seed = MemoryStore()
+    seed.prepared["P_once"] = {"prepare_id": "P_once", "executed": False, "request_id": None}
+
+    async def scenario():
+        async with backend.request(seed):
+            pass
+
+        async def execute(worker):
+            async with backend.request(worker):
+                prepared = worker.prepared["P_once"]
+                if prepared["executed"]:
+                    return prepared["request_id"]
+                prepared["executed"] = True
+                prepared["request_id"] = "WEB_AGENT_SHARED_ONCE"
+                return prepared["request_id"]
+
+        results = await asyncio.gather(execute(MemoryStore()), execute(MemoryStore()))
+        assert results == ["WEB_AGENT_SHARED_ONCE", "WEB_AGENT_SHARED_ONCE"]
 
     asyncio.run(scenario())
 

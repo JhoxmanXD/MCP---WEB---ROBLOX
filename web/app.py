@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,14 @@ except ImportError:  # Render runs `uvicorn app:app` from web/
     from agent_state import AgentStateConflict as AgentStateBackendConflict, AgentStateBackendError, AgentStateBackendUnavailable, AgentStateIncompatible, build_agent_state_backend
     from build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 
-app = FastAPI(title="MCP-WEB", version="0.1.0")
+@asynccontextmanager
+async def app_lifespan(_app):
+    if agent_state_backend.shared:
+        await agent_state_backend.roundtrip()
+    yield
+
+
+app = FastAPI(title="MCP-WEB", version="0.1.0", lifespan=app_lifespan)
 store = MemoryStore()
 agent_state_backend = build_agent_state_backend()
 STATIC = Path(__file__).parent / "static"
@@ -170,7 +178,7 @@ async def read_latest() -> HTMLResponse:
 @app.get("/api/v1/health.json")
 async def health() -> JSONResponse:
     backend = agent_state_backend.status()
-    return payload({"ok": True, "service": "MCP-WEB", "version": "0.1.0", "local_client_online": store.online(), "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "agent_state_backend": backend.get("mode"), "agent_state_backend_connected": bool(backend.get("connected")), "agent_state_schema_version": backend.get("schema_version"), "agent_state": backend})
+    return payload({"ok": True, "service": "MCP-WEB", "version": "0.1.0", "local_client_online": store.online(), "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "agent_state_backend": backend.get("mode"), "agent_state_backend_connected": bool(backend.get("connected")), "agent_state_schema_version": backend.get("schema_version"), "agent_state_roundtrip": backend.get("roundtrip"), "agent_state": backend})
 
 
 @app.get("/api/v1/catalog.json")
@@ -252,4 +260,4 @@ async def state(state_key: str) -> JSONResponse:
 @app.get("/api/v1/dashboard.json")
 async def dashboard_data() -> JSONResponse:
     backend = agent_state_backend.status()
-    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "agent_state_backend": backend.get("mode"), "agent_state_backend_connected": bool(backend.get("connected")), "agent_state_schema_version": backend.get("schema_version"), "agent_state": backend, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
+    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "agent_state_backend": backend.get("mode"), "agent_state_backend_connected": bool(backend.get("connected")), "agent_state_schema_version": backend.get("schema_version"), "agent_state_roundtrip": backend.get("roundtrip"), "agent_state": backend, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})

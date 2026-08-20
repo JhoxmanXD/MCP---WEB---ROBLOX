@@ -158,6 +158,8 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         draft = store.drafts.get(action.get("draft_id"))
         if draft and not action.get("expires_at"):
             action["expires_at"] = draft.get("expires_at")
+        action.setdefault("state_schema_version", "agent-state-v1")
+        store.pending_agent_action_ids.add(action["action_id"])
         lock = getattr(store, "lock", None)
         if lock is None:
             store.actions[action["action_id"]] = action
@@ -166,19 +168,19 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 store.actions[action["action_id"]] = action
         context = lifecycle_context()
         logger.info(
-            "ACTION_CREATED action_id=%s draft_id=%s view_id=%s expected_revision=%s operation=%s created_at=%s store_id=%s process_id=%s instance_id=%s",
+            "ACTION_CREATED action_id=%s draft_id=%s view_id=%s expected_revision=%s operation=%s created_at=%s store_id=%s process_id=%s instance_id=%s persisted=pending state_backend=%s",
             action["action_id"], action.get("draft_id"), action.get("view_id"),
             action.get("expected_revision"), action.get("operation"), action.get("created_at"),
             context["store_id"], context["process_id"], context["instance_id"],
+            (agent_state_status() if agent_state_status else {}).get("mode", "memory"),
         )
 
     def expired_state(kind: str, state_id: str, detail: str = "") -> HTMLResponse:
         context = lifecycle_context()
         logger.warning(
-            "AGENT_STATE_EXPIRED kind=%s state_id=%s store_id=%s process_id=%s instance_id=%s action_count=%s drafts=%s views=%s detail=%s",
-            kind, state_id, context["store_id"], context["process_id"], context["instance_id"],
-            len(store.actions), len(store.drafts), len(store.views),
-            detail or "none",
+            "AGENT_STATE_EXPIRED kind=%s state_id=%s reason=%s store_id=%s process_id=%s instance_id=%s action_count=%s drafts=%s views=%s detail=%s",
+            kind, state_id, detail or "none", context["store_id"], context["process_id"], context["instance_id"],
+            len(store.actions), len(store.drafts), len(store.views), detail or "none",
         )
         body = (
             "<h1>AGENT STATE EXPIRED</h1>"
@@ -194,12 +196,14 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
 
     def missing_action(action_id: str) -> HTMLResponse:
         context = lifecycle_context()
+        backend = agent_state_status() if agent_state_status else {}
         logger.warning(
-            "ACTION_LOOKUP action_id=%s exists=no store_id=%s process_id=%s instance_id=%s action_count=%s drafts=%s views=%s draft_exists=no view_exists=no",
-            action_id, context["store_id"], context["process_id"], context["instance_id"],
+            "ACTION_LOOKUP action_id=%s exists=no reason=ACTION_KEY_MISSING redis_key=%s namespace=%s store_id=%s process_id=%s instance_id=%s action_count=%s drafts=%s views=%s draft_exists=no view_exists=no deserialize_status=not-found",
+            action_id, backend.get("state_key", "unknown"), backend.get("namespace", "unknown"),
+            context["store_id"], context["process_id"], context["instance_id"],
             len(store.actions), len(store.drafts), len(store.views),
         )
-        return expired_state("action", action_id, "missing")
+        return expired_state("action", action_id, "ACTION_KEY_MISSING")
 
     def purge_drafts() -> None:
         now_epoch = time.time()
@@ -295,7 +299,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             "created_at": now(),
             "expires_at": store.drafts.get(draft_id, {}).get("expires_at"),
             "consumed": False,
-            "resulting_view_id": None,
+            "resulting_url": None,
         })
         return f"/agent/action/{action_id}"
 
@@ -771,7 +775,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         heartbeat = store.heartbeat.model_dump(mode="json") if store.heartbeat else {}
         backend = agent_state_status() if agent_state_status else {"mode": "memory", "shared": False, "connected": True}
         backend_text = escape(json.dumps(backend, ensure_ascii=False, sort_keys=True))
-        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>AGENT_STATE_BACKEND: <code>{escape(str(backend.get('mode')))}</code></p><p>AGENT_STATE_SHARED: <code>{str(bool(backend.get('shared'))).lower()}</code></p><p>AGENT_STATE_CONNECTED: <code>{str(bool(backend.get('connected'))).lower()}</code></p><p>AGENT_STATE_STATUS: <code>{backend_text}</code></p><p>STORE_ID: <code>{escape(context['store_id'])}</code></p><p>PROCESS_ID: <code>{escape(context['process_id'])}</code></p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
+        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>AGENT_STATE_BACKEND: <code>{escape(str(backend.get('mode')))}</code></p><p>AGENT_STATE_SHARED: <code>{str(bool(backend.get('shared'))).lower()}</code></p><p>AGENT_STATE_CONNECTED: <code>{str(bool(backend.get('connected'))).lower()}</code></p><p>AGENT_STATE_ROUNDTRIP: <code>{str(backend.get('roundtrip')).lower()}</code></p><p>AGENT_STATE_STATUS: <code>{backend_text}</code></p><p>STORE_ID: <code>{escape(context['store_id'])}</code></p><p>PROCESS_ID: <code>{escape(context['process_id'])}</code></p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
         return agent_page("Agent Status", body)
 
     @app.get("/agent/tools", response_class=HTMLResponse)
@@ -823,8 +827,12 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             return missing_action(action_id)
         context = lifecycle_context()
         logger.info(
-            "ACTION_LOOKUP action_id=%s exists=yes store_id=%s process_id=%s instance_id=%s action_count=%s draft_id=%s view_id=%s draft_exists=%s view_exists=%s expected_revision=%s consumed=%s",
-            action_id, context["store_id"], context["process_id"], context["instance_id"],
+            "ACTION_LOOKUP action_id=%s exists=yes reason=FOUND redis_key=%s redis_ttl=%s namespace=%s store_id=%s process_id=%s instance_id=%s action_count=%s draft_id=%s view_id=%s draft_exists=%s view_exists=%s expected_revision=%s consumed=%s deserialize_status=ok",
+            action_id,
+            (agent_state_status() if agent_state_status else {}).get("state_key", "unknown"),
+            getattr(store, "agent_state_observed_ttl", "unknown"),
+            (agent_state_status() if agent_state_status else {}).get("namespace", "unknown"),
+            context["store_id"], context["process_id"], context["instance_id"],
             len(store.actions), action.get("draft_id"), action.get("view_id"),
             action.get("draft_id") in store.drafts, action.get("view_id") in store.views,
             action.get("expected_revision"), action.get("consumed"),

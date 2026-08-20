@@ -32,6 +32,11 @@ class MemoryStore:
         self.prepared: dict[str, dict[str, Any]] = {}
         self.result_views: dict[str, dict[str, Any]] = {}
         self.editors: dict[str, dict[str, Any]] = {}
+        # Request-local publication audit. Shared backends use this to verify
+        # that every Action rendered by a response is durable before bytes are
+        # sent to the client.
+        self.pending_agent_action_ids: set[str] = set()
+        self.agent_state_observed_ttl: int | None = None
 
     def export_agent_state(self) -> dict[str, Any]:
         """Return JSON-safe workflow state for a shared state backend.
