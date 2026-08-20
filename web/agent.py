@@ -35,6 +35,37 @@ def schema_type(schema: dict[str, Any]) -> str:
     return "value"
 
 
+def roblox_type(schema: dict[str, Any]) -> str | None:
+    value = schema.get("roblox_type") or schema.get("robloxType") or schema.get("x-roblox-type")
+    return value if isinstance(value, str) else None
+
+
+def typed_schema(value_type: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata = metadata or {}
+    schema: dict[str, Any] = {"type": "object", "roblox_type": value_type}
+    if value_type == "Vector2":
+        schema["properties"] = {"x": {"type": "number"}, "y": {"type": "number"}}
+    elif value_type == "Vector3":
+        schema["properties"] = {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}
+    elif value_type == "Color3":
+        schema["properties"] = {"r": {"type": "number", "minimum": 0, "maximum": 1}, "g": {"type": "number", "minimum": 0, "maximum": 1}, "b": {"type": "number", "minimum": 0, "maximum": 1}}
+    elif value_type == "CFrame":
+        schema["properties"] = {str(index): {"type": "number"} for index in range(12)}
+    elif value_type == "UDim":
+        schema["properties"] = {"scale": {"type": "number"}, "offset": {"type": "integer"}}
+    elif value_type == "UDim2":
+        schema["properties"] = {"x": typed_schema("UDim"), "y": typed_schema("UDim")}
+    elif value_type == "NumberRange":
+        schema["properties"] = {"min": {"type": "number"}, "max": {"type": "number"}}
+    elif value_type == "BrickColor":
+        schema["properties"] = {"number": {"type": "integer"}, "name": {"type": "string"}}
+    if metadata.get("enumValues") or metadata.get("enum_values"):
+        schema["enum_values"] = copy.deepcopy(metadata.get("enumValues") or metadata.get("enum_values"))
+    if metadata.get("enumType") or metadata.get("enum_type"):
+        schema["enum_type"] = metadata.get("enumType") or metadata.get("enum_type")
+    return schema
+
+
 def nullable(schema: dict[str, Any]) -> bool:
     return any(option.get("type") == "null" for option in schema.get("anyOf", []) + schema.get("oneOf", [])) or schema.get("type") == "null"
 
@@ -157,7 +188,7 @@ def register_agent_routes(app, store, current_studio_connected):
     def path_get(value: Any, path: list[Any]) -> Any:
         current = value
         for part in path:
-            current = current[part]
+            current = current[int(part)] if isinstance(current, list) else current[part]
         return current
 
     def path_set(value: Any, path: list[Any], replacement: Any) -> None:
@@ -199,6 +230,18 @@ def register_agent_routes(app, store, current_studio_connected):
 
     def default_for_schema(schema: dict[str, Any]) -> Any:
         if "default" in schema: return copy.deepcopy(schema["default"])
+        special = roblox_type(schema)
+        if special == "Vector2": return {"$type": "Vector2", "x": 0, "y": 0}
+        if special == "Vector3": return {"$type": "Vector3", "x": 0, "y": 0, "z": 0}
+        if special == "Color3": return {"$type": "Color3", "r": 0, "g": 0, "b": 0}
+        if special == "CFrame": return {"$type": "CFrame", "components": [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]}
+        if special == "UDim": return {"$type": "UDim", "scale": 0, "offset": 0}
+        if special == "UDim2": return {"$type": "UDim2", "x": {"$type": "UDim", "scale": 0, "offset": 0}, "y": {"$type": "UDim", "scale": 0, "offset": 0}}
+        if special == "NumberRange": return {"$type": "NumberRange", "min": 0, "max": 0}
+        if special == "BrickColor": return {"$type": "BrickColor", "number": 1, "name": "White"}
+        if special == "EnumItem":
+            values = schema.get("enum_values", [])
+            return copy.deepcopy(values[0]) if values else None
         typ = schema_type(schema)
         if typ == "object": return {}
         if typ == "array": return []
@@ -210,7 +253,7 @@ def register_agent_routes(app, store, current_studio_connected):
     def selector_schema(name: str, schema: dict[str, Any]) -> bool:
         return name.lower() in {"ref", "parent", "target", "instance", "selection", "script"}
 
-    def create_editor(view: dict[str, Any], path: list[Any], kind: str = "value", schema: dict[str, Any] | None = None) -> str:
+    def create_editor(view: dict[str, Any], path: list[Any], kind: str = "value", schema: dict[str, Any] | None = None, property_schemas: dict[str, dict[str, Any]] | None = None, parent_schema: dict[str, Any] | None = None) -> str:
         editor_id = "E_" + uuid4().hex[:18]
         editor_schema = copy.deepcopy(schema or {})
         if path:
@@ -220,12 +263,12 @@ def register_agent_routes(app, store, current_studio_connected):
                 value = default_for_schema(editor_schema)
         else:
             value = copy.deepcopy(view["arguments_snapshot"])
-        store.editors[editor_id] = {"editor_id": editor_id, "view_id": view["view_id"], "draft_id": view["draft_id"], "revision": view["revision"], "path": copy.deepcopy(path), "kind": kind, "schema": editor_schema or infer_schema(value), "value_snapshot": value, "action_ids": {}}
+        store.editors[editor_id] = {"editor_id": editor_id, "view_id": view["view_id"], "draft_id": view["draft_id"], "revision": view["revision"], "path": copy.deepcopy(path), "kind": kind, "schema": editor_schema or infer_schema(value), "parent_schema": copy.deepcopy(parent_schema), "property_schemas": copy.deepcopy(property_schemas or {}), "value_snapshot": value, "action_ids": {}}
         return f"/agent/editor/{editor_id}"
 
-    def create_key_editor(view: dict[str, Any], parent_path: list[Any]) -> str:
+    def create_key_editor(view: dict[str, Any], parent_path: list[Any], parent_schema: dict[str, Any] | None = None, property_schemas: dict[str, dict[str, Any]] | None = None) -> str:
         editor_id = "E_" + uuid4().hex[:18]
-        store.editors[editor_id] = {"editor_id": editor_id, "view_id": view["view_id"], "draft_id": view["draft_id"], "revision": view["revision"], "path": copy.deepcopy(parent_path), "kind": "key", "schema": {"type": "string"}, "value_snapshot": "", "action_ids": {}}
+        store.editors[editor_id] = {"editor_id": editor_id, "view_id": view["view_id"], "draft_id": view["draft_id"], "revision": view["revision"], "path": copy.deepcopy(parent_path), "kind": "key", "schema": {"type": "string"}, "parent_schema": copy.deepcopy(parent_schema or {"type": "object", "additionalProperties": True}), "property_schemas": copy.deepcopy(property_schemas or {}), "value_snapshot": "", "action_ids": {}}
         return f"/agent/editor/{editor_id}"
 
     def editor_action_link(editor: dict[str, Any], operation: str, payload: dict[str, Any], label: str) -> str:
@@ -249,17 +292,50 @@ def register_agent_routes(app, store, current_studio_connected):
             actions += [editor_action_link(editor, "editor_backspace_key", {}, "Backspace"), editor_action_link(editor, "editor_clear_key", {}, "Clear"), editor_action_link(editor, "editor_finish_key", {}, "Finish"), editor_back(editor)]
             body = f"<h1>Object Key Composer</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>CURRENT KEY: <code>{escape(str(value))}</code></p><p>{' '.join(actions)}</p>"
             return agent_page("Object Key Composer", body)
+        special = roblox_type(schema)
+        if special in {"Vector2", "Vector3", "Color3", "CFrame", "UDim", "UDim2", "NumberRange", "BrickColor"}:
+            if special == "Vector2":
+                components = [("X", ["x"]), ("Y", ["y"])]
+            elif special == "Vector3":
+                components = [("X", ["x"]), ("Y", ["y"]), ("Z", ["z"])]
+            elif special == "Color3":
+                components = [("R", ["r"]), ("G", ["g"]), ("B", ["b"])]
+            elif special == "CFrame":
+                components = [(label, ["components", str(index)]) for index, label in enumerate(("X", "Y", "Z", "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"))]
+            elif special == "UDim":
+                components = [("Scale", ["scale"]), ("Offset", ["offset"])]
+            elif special == "UDim2":
+                components = [("X Scale", ["x", "scale"]), ("X Offset", ["x", "offset"]), ("Y Scale", ["y", "scale"]), ("Y Offset", ["y", "offset"])]
+            elif special == "NumberRange":
+                components = [("Min", ["min"]), ("Max", ["max"])]
+            else:
+                components = [("Number", ["number"]), ("Name", ["name"])]
+            for label, suffix in components:
+                component_schema = {"type": "number" if label != "Name" else "string"}
+                if special == "Color3":
+                    component_schema.update({"minimum": 0, "maximum": 1})
+                actions.append(editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + suffix, "kind": component_schema["type"], "schema": component_schema, "parent_schema": schema}, f"Edit {label}"))
+            body = f"<h1>{escape(special)} Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>ROBLOX_TYPE: <code>{escape(special)}</code></p><pre>{escape(json.dumps(value, ensure_ascii=False, indent=2))}</pre><p>{' '.join(actions)} {editor_back(editor)}</p>"
+            return agent_page(f"{special} Editor", body)
+        if special == "EnumItem":
+            values = schema.get("enum_values", [])
+            actions = [editor_action_link(editor, "editor_set_value", {"value": item}, f"Set {item.get('name', 'enum value')}") for item in values if isinstance(item, dict)]
+            body = f"<h1>Enum Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>ROBLOX_TYPE: <code>EnumItem</code></p><p>ENUM_TYPE: <code>{escape(str(schema.get('enum_type', 'unknown')))}</code></p><pre>{escape(json.dumps(value, ensure_ascii=False, indent=2))}</pre><p>{' '.join(actions) or 'No enum metadata available; typed picker unavailable.'} {editor_back(editor)}</p>"
+            return agent_page("Enum Editor", body)
+        if special in {"PhysicalProperties", "Font", "NumberSequence", "ColorSequence", "Rect", "Vector2"} and special not in {"Vector2"}:
+            body = f"<h1>Unsupported Typed Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>ROBLOX_TYPE: <code>{escape(special)}</code></p><p>This Roblox type is readable or metadata-visible but has no safe write editor in the current bridge contract.</p><p>{editor_back(editor)}</p>"
+            return agent_page("Unsupported Typed Editor", body)
         typ = schema_type(schema)
         if typ == "object":
             items = []
             properties = schema.get("properties", {}) if isinstance(schema.get("properties"), dict) else {}
             for key, item in value.items() if isinstance(value, dict) else []:
-                item_schema = properties.get(key) or (schema.get("additionalProperties") if isinstance(schema.get("additionalProperties"), dict) else None)
+                item_schema = editor.get("property_schemas", {}).get(str(key)) or properties.get(key) or (schema.get("additionalProperties") if isinstance(schema.get("additionalProperties"), dict) else None)
                 item_schema = item_schema or infer_schema(item)
-                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [key], "kind": schema_type(item_schema), "schema": item_schema}, f"Edit {key}")
+                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [key], "kind": roblox_type(item_schema) or schema_type(item_schema), "schema": item_schema, "parent_schema": schema}, f"Edit {key}")
                 remove = editor_action_link(editor, "editor_remove_key", {"key": key}, f"Remove {key}")
                 items.append(f"<li><strong>{escape(str(key))}</strong>: <code>{escape(str(item))}</code> {edit} {remove}</li>")
-            add = editor_action_link(editor, "editor_open_key", {}, "Add field")
+            add = editor_action_link(editor, "editor_open_key", {"parent_schema": schema}, "Add field")
             clear = editor_action_link(editor, "editor_clear_container", {}, "Clear object")
             body = f"<h1>Object Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><pre>{escape(json.dumps(value, ensure_ascii=False, indent=2))}</pre><ul>{''.join(items) or '<li>No fields</li>'}</ul><p>{add} {clear} {editor_back(editor)}</p>"
             return agent_page("Object Editor", body)
@@ -268,7 +344,7 @@ def register_agent_routes(app, store, current_studio_connected):
             item_schema = schema.get("items", {}) if isinstance(schema.get("items"), dict) else {}
             for index, item in enumerate(value if isinstance(value, list) else []):
                 actual_schema = item_schema if item_schema and schema_type(item_schema) != "value" else infer_schema(item)
-                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [index], "kind": schema_type(actual_schema), "schema": actual_schema}, f"Edit item {index}")
+                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [index], "kind": roblox_type(actual_schema) or schema_type(actual_schema), "schema": actual_schema, "parent_schema": schema}, f"Edit item {index}")
                 remove = editor_action_link(editor, "editor_remove_item", {"index": index}, f"Remove item {index}")
                 items.append(f"<li><code>{escape(str(item))}</code> {edit} {remove}</li>")
             add = editor_action_link(editor, "editor_add_item", {"value": default_for_schema(item_schema)}, "Add item")
@@ -289,7 +365,8 @@ def register_agent_routes(app, store, current_studio_connected):
             actions += [editor_action_link(editor, "editor_backspace", {}, "Backspace"), editor_action_link(editor, "editor_clear_scalar", {}, "Clear"), editor_action_link(editor, "editor_finish_scalar", {}, "Finish")]
         elif typ == "value":
             actions += [editor_action_link(editor, "editor_initialize_value", {"value_type": "string"}, "Edit as string"), editor_action_link(editor, "editor_initialize_value", {"value_type": "number"}, "Edit as number"), editor_action_link(editor, "editor_initialize_value", {"value_type": "boolean"}, "Edit as boolean"), editor_action_link(editor, "editor_initialize_value", {"value_type": "object"}, "Edit as object"), editor_action_link(editor, "editor_initialize_value", {"value_type": "array"}, "Edit as array"), editor_action_link(editor, "editor_set_value", {"value": None}, "Set null")]
-        body = f"<h1>Value Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>TYPE: {escape(typ)}</p><p>CURRENT VALUE: <code>{escape(str(value))}</code></p><p>{' '.join(actions)} {editor_back(editor)}</p>"
+        displayed_type = "unknown (generic fallback)" if typ == "value" else typ
+        body = f"<h1>Value Editor</h1><p>EDITOR_ID: <code>{escape(editor['editor_id'])}</code></p><p>DRAFT_REVISION: {editor['revision']}</p><p>TYPE: <code>{escape(displayed_type)}</code></p><p>CURRENT VALUE: <code>{escape(str(value))}</code></p><p>{' '.join(actions)} {editor_back(editor)}</p>"
         return agent_page("Value Editor", body)
 
     def stale_page(action: dict[str, Any], draft: dict[str, Any]) -> HTMLResponse:
@@ -348,6 +425,125 @@ def register_agent_routes(app, store, current_studio_connected):
                 return job.model_dump(mode="json")
             await asyncio.sleep(0.25)
         return store.jobs[request_id].model_dump(mode="json")
+
+    def result_data(result: Any) -> Any:
+        if not isinstance(result, dict):
+            return None
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured.get("data", structured)
+        for item in result.get("content", []):
+            text_value = item.get("text") if isinstance(item, dict) else None
+            if isinstance(text_value, str):
+                try:
+                    decoded = json.loads(text_value)
+                    if isinstance(decoded, dict):
+                        return decoded.get("data", decoded)
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    def property_schema_from_metadata(metadata: dict[str, Any] | None, current: Any = None) -> dict[str, Any] | None:
+        metadata = metadata or {}
+        value = metadata.get("value", current)
+        roblox_value_type = metadata.get("robloxType") or metadata.get("roblox_type")
+        if not roblox_value_type and isinstance(value, dict):
+            roblox_value_type = value.get("$type")
+        if not isinstance(roblox_value_type, str) or roblox_value_type in {"nil", "Unreadable", "Unsupported", "Truncated"}:
+            return None
+        if roblox_value_type in {"boolean", "number", "string", "Instance"}:
+            return {"type": {"boolean": "boolean", "number": "number", "string": "string"}.get(roblox_value_type, "object")}
+        return typed_schema(roblox_value_type, metadata)
+
+    def property_context(draft: dict[str, Any], object_path: list[Any]) -> dict[str, Any]:
+        tool_name = draft.get("tool_name", "")
+        arguments = draft.get("arguments", {})
+        if tool_name in {"studio_set_properties", "set_properties", "properties"} and object_path and object_path[0] == "values":
+            return {"ref": arguments.get("ref")}
+        if tool_name in {"studio_create_instance", "create", "instance.create"} and object_path and object_path[0] == "properties":
+            return {"class_name": arguments.get("class_name") or arguments.get("className")}
+        if object_path and object_path[0] == "operations":
+            try:
+                index = int(object_path[1])
+                operation = arguments.get("operations", [])[index]
+                if isinstance(operation, dict):
+                    operation_args = operation.get("args") if isinstance(operation.get("args"), dict) else operation
+                    operation_name = operation.get("operation") or operation.get("kind") or operation.get("tool") or ""
+                    if any(part in {"properties", "values"} for part in object_path[2:]):
+                        if operation_name in {"create", "studio_create_instance", "instance.create"}:
+                            return {"class_name": operation_args.get("class_name") or operation_args.get("className")}
+                        if operation_name in {"set_properties", "studio_set_properties", "properties.set"}:
+                            return {"ref": operation_args.get("ref") or operation_args.get("instance")}
+            except (IndexError, TypeError, ValueError):
+                pass
+        return {}
+
+    def schema_at_path(schema: dict[str, Any], path: list[Any]) -> dict[str, Any]:
+        current = schema
+        for part in path:
+            properties = current.get("properties", {}) if isinstance(current, dict) else {}
+            if isinstance(properties, dict) and str(part) in properties:
+                current = properties[str(part)]
+            elif isinstance(current, dict) and isinstance(current.get("additionalProperties"), dict):
+                current = current["additionalProperties"]
+            elif isinstance(current, dict) and isinstance(current.get("items"), dict):
+                current = current["items"]
+            else:
+                break
+        return current if isinstance(current, dict) else {}
+
+    async def resolve_property_schemas(draft: dict[str, Any], object_path: list[Any], names: list[str]) -> dict[str, dict[str, Any]]:
+        if not names:
+            return {}
+        cache = draft.setdefault("property_metadata", {})
+        missing_names = [name for name in names if name not in cache]
+        hint_schema = schema_at_path(draft.get("schema", {}), object_path)
+        hints = hint_schema.get("x-roblox-property-metadata") or hint_schema.get("x_roblox_property_metadata") or {}
+        if isinstance(hints, dict):
+            for name in missing_names:
+                if isinstance(hints.get(name), dict):
+                    cache[name] = copy.deepcopy(hints[name])
+            missing_names = [name for name in missing_names if name not in cache]
+        context = property_context(draft, object_path)
+        if missing_names and (context.get("ref") is not None or context.get("class_name")):
+            tool_name = "studio_get_properties" if "studio_get_properties" in catalog_tools() else "properties"
+            request: dict[str, Any] = {"names": missing_names}
+            if context.get("ref") is not None:
+                request["ref"] = context["ref"]
+            else:
+                request["class_name"] = context["class_name"]
+            job = await discover(tool_name, request)
+            data = result_data(job.get("result")) if isinstance(job, dict) and job.get("status") == "completed" else None
+            if isinstance(data, dict):
+                metadata = data.get("propertyMetadata") or data.get("property_metadata") or {}
+                values = data.get("properties") or {}
+                for name in missing_names:
+                    if name in metadata:
+                        cache[name] = copy.deepcopy(metadata[name])
+                    elif name in values:
+                        cache[name] = {"value": copy.deepcopy(values[name])}
+            if missing_names and context.get("class_name") and tool_name == "studio_get_properties" and "studio_find_instances" in catalog_tools():
+                sample_job = await discover("studio_find_instances", {"query": "", "class_name": context["class_name"], "limit": 1})
+                samples = result_data(sample_job.get("result")) if isinstance(sample_job, dict) and sample_job.get("status") == "completed" else None
+                if isinstance(samples, list) and samples and isinstance(samples[0], dict):
+                    sample_ref = samples[0].get("ref") or samples[0].get("id") or samples[0].get("path")
+                    if sample_ref:
+                        sample_properties = await discover("studio_get_properties", {"ref": sample_ref, "names": missing_names})
+                        sample_data = result_data(sample_properties.get("result")) if isinstance(sample_properties, dict) and sample_properties.get("status") == "completed" else None
+                        if isinstance(sample_data, dict):
+                            metadata = sample_data.get("propertyMetadata") or sample_data.get("property_metadata") or {}
+                            values = sample_data.get("properties") or {}
+                            for name in missing_names:
+                                if name in metadata:
+                                    cache[name] = copy.deepcopy(metadata[name])
+                                elif name in values:
+                                    cache[name] = {"value": copy.deepcopy(values[name])}
+        result: dict[str, dict[str, Any]] = {}
+        for name in names:
+            typed = property_schema_from_metadata(cache.get(name))
+            if typed:
+                result[name] = typed
+        return result
 
     def candidate_from(value: dict[str, Any]) -> dict[str, Any] | None:
         if not (value.get("ref") or value.get("path")):
@@ -478,13 +674,22 @@ def register_agent_routes(app, store, current_studio_connected):
             source_view = store.views.get(payload.get("view_id"))
             if not source_view:
                 raise HTTPException(404, "Source view not found")
-            target = create_editor(source_view, list(payload["path"]), payload.get("kind", "value"), payload.get("schema"))
+            editor_path = list(payload["path"])
+            editor_schema = payload.get("schema")
+            property_schemas = {}
+            try:
+                source_value = path_get(source_view["arguments_snapshot"], editor_path) if editor_path else source_view["arguments_snapshot"]
+            except (KeyError, IndexError, TypeError):
+                source_value = default_for_schema(editor_schema or {})
+            if isinstance(source_value, dict) and isinstance(editor_schema, dict) and schema_type(editor_schema) == "object":
+                property_schemas = await resolve_property_schemas(draft, editor_path, [str(key) for key in source_value])
+            target = create_editor(source_view, editor_path, payload.get("kind", roblox_type(editor_schema or {}) or "value"), editor_schema, property_schemas, payload.get("parent_schema"))
         elif operation == "editor_open_key":
             editor = store.editors.get(payload.get("editor_id"))
             if not editor:
                 raise HTTPException(404, "Editor not found")
             source_view = store.views.get(editor["view_id"])
-            target = create_key_editor(source_view, editor["path"])
+            target = create_key_editor(source_view, editor["path"], payload.get("parent_schema") or editor.get("schema"), editor.get("property_schemas"))
         elif operation in {"editor_append_key", "editor_backspace_key", "editor_clear_key"}:
             editor = store.editors.get(payload.get("editor_id"))
             if not editor:
@@ -494,7 +699,7 @@ def register_agent_routes(app, store, current_studio_connected):
             elif operation == "editor_backspace_key": value = value[:-1]
             else: value = ""
             cloned_view = store.views.get(editor["view_id"])
-            target = create_key_editor(cloned_view, editor["path"])
+            target = create_key_editor(cloned_view, editor["path"], editor.get("parent_schema"), editor.get("property_schemas"))
             new_editor_id = target.rsplit("/", 1)[-1]
             store.editors[new_editor_id]["value_snapshot"] = value
         elif operation == "editor_finish_key":
@@ -503,12 +708,17 @@ def register_agent_routes(app, store, current_studio_connected):
                 raise HTTPException(404, "Editor not found")
             key = str(editor["value_snapshot"])
             if not key:
-                target = create_editor(store.views[editor["view_id"]], editor["path"], "object")
+                target = create_editor(store.views[editor["view_id"]], editor["path"], "object", editor.get("parent_schema"), editor.get("property_schemas"))
             else:
                 path_set(draft["arguments"], editor["path"] + [key], None)
                 bump(draft)
                 next_view = create_agent_view(draft)
-                target = create_editor(store.views[next_view], editor["path"], "object")
+                property_schemas = await resolve_property_schemas(draft, editor["path"], [key])
+                if key in property_schemas:
+                    path_set(draft["arguments"], editor["path"] + [key], default_for_schema(property_schemas[key]))
+                    bump(draft)
+                    next_view = create_agent_view(draft)
+                target = create_editor(store.views[next_view], editor["path"], "object", editor.get("parent_schema") or {"type": "object", "additionalProperties": True}, {**editor.get("property_schemas", {}), **property_schemas})
         elif operation == "editor_initialize_value":
             editor = store.editors.get(payload.get("editor_id"))
             if not editor:
@@ -585,7 +795,9 @@ def register_agent_routes(app, store, current_studio_connected):
             elif len(path) > 1:
                 parent_path = path[:-1]
                 parent_value = path_get(store.views[next_view]["arguments_snapshot"], parent_path)
-                target = create_editor(store.views[next_view], parent_path, "array" if isinstance(parent_value, list) else "object")
+                parent_schema = editor.get("parent_schema") or ("array" if isinstance(parent_value, list) else {"type": "object"})
+                parent_kind = roblox_type(parent_schema) or ("array" if isinstance(parent_value, list) else "object") if isinstance(parent_schema, dict) else parent_schema
+                target = create_editor(store.views[next_view], parent_path, parent_kind, parent_schema if isinstance(parent_schema, dict) else None, editor.get("property_schemas"))
             else:
                 target = f"/agent/view/{next_view}"
         elif operation == "prepare":

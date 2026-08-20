@@ -39,3 +39,14 @@ Para workflows de Studio:
 - el resultado estructurado conserva el candidato de Instance y su path estructurado; el path con puntos es solo `displayPath` humano.
 
 El modo de enlaces está pensado para argumentos cortos. Para source Luau o JSON grande, usa la API raw existente o el modo humano cuando esté disponible.
+
+## Propiedades Roblox typed
+
+Cuando el bridge publica metadata de la propiedad, el gateway muestra un editor typed en lugar del fallback genérico:
+
+- `Vector3`: componentes `X`, `Y`, `Z`, serializados como `{\"$type\":\"Vector3\",\"x\":...,\"y\":...,\"z\":...}`.
+- `Color3`: componentes `R`, `G`, `B` normalizados entre `0` y `1`.
+- `EnumItem`: picker con los valores reales del enum, por ejemplo `Material → Grass`.
+- `CFrame`, `Vector2`, `UDim`, `UDim2`, `NumberRange` y `BrickColor`: editor typed cuando el bridge confirma el tipo y su representación escribible.
+
+La resolución usa el valor actual para `studio_set_properties` y metadata por `class_name` para `studio_create_instance`; la herencia de Roblox la resuelve Studio, no una tabla duplicada en MCP-WEB. Si no hay metadata, aparece explícitamente el editor genérico de fallback. `create_instance.properties`, `set_properties.values` y operaciones typed dentro de `batch` usan el mismo dispatch.

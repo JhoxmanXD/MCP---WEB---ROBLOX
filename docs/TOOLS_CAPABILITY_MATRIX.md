@@ -8,7 +8,7 @@ Fuente: `MCP tools/list` del bridge local. El gateway no hardcodea handlers; cad
 | Tree/selection/find | `studio_get_tree`, `tree`, `studio_get_selection`, `selection`, `studio_set_selection`, `studio_find_instances`, `find` | Completa para lecturas sin argumentos; parcial para refs, arrays y consultas libres |
 | Instance/properties/tags | `studio_get_instance`, `instance`, `studio_get_properties`, `properties`, `studio_get_attributes`, `attributes`, `studio_get_tags`, `tags`, `studio_list_services`, `list_services` | Navegable: refs reales usan picker; objects/arrays usan editor recursivo |
 | Create/modify | `studio_create_instance`, `create`, `studio_destroy_instance`, `destroy`, `studio_rename_instance`, `rename`, `studio_clone_instance`, `studio_reparent_instance`, `reparent` | Navegable para escalares, objetos/arrays y refs; la ejecución sigue dependiendo del estado real |
-| Properties/attributes/tags/batch | `studio_set_properties`, `set_properties`, `studio_set_attributes`, `set_attributes`, `studio_set_tags`, `set_tags`, `studio_add_tag`, `studio_remove_tag`, `studio_batch`, `batch` | Navegable con editor recursivo de objetos/arrays; valores Roblox complejos requieren datos válidos |
+| Properties/attributes/tags/batch | `studio_set_properties`, `set_properties`, `studio_set_attributes`, `set_attributes`, `studio_set_tags`, `set_tags`, `studio_add_tag`, `studio_remove_tag`, `studio_batch`, `batch` | Editor typed para metadata confirmada; fallback genérico explícito cuando no existe metadata |
 | Scripts | `studio_read_script`, `script_read`, `read`, `studio_create_script`, `script_create`, `create_script`, `studio_replace_script`, `script_replace`, `replace`, `studio_patch_script`, `script_patch`, `patch`, `studio_open_script`, `open`, `studio_list_open_scripts`, `list_open_scripts` | Lecturas sin args completas; escritura parcial por source/patch grande |
 | Output/history | `studio_get_output`, `output`, `studio_clear_output_buffer`, `studio_undo`, `undo`, `studio_redo`, `redo`, `studio_can_undo`, `studio_can_redo` | Completa para defaults/lecturas; acciones de escritura requieren confirmación humana |
 | Playtest | `studio_playtest`, `playtest` | Parcial: enum `action` se puede navegar, pero requiere validación del estado real |
@@ -31,3 +31,9 @@ Las familias prácticas prioritarias son: sesiones, estado, place, árbol, selec
 - Blocked: 0 por nombre. Una tool puede quedar `Not ready` si el usuario no proporciona un valor complejo válido.
 
 La matriz es deliberadamente honesta: listar y describir una tool es dinámico para las 71; el gateway representa recursivamente los schemas JSON, mientras que la ejecución todavía requiere valores válidos y un Studio conectado.
+
+## Property metadata y editores typed
+
+El bridge/plugin es la fuente de verdad de los tipos Roblox. `studio_get_properties` devuelve valores `$type` y `propertyMetadata`; con `class_name` puede describir defaults de una clase sin parentar una instancia. MCP-WEB no mantiene un mapa `Part → propiedades`: la herencia se resuelve en Roblox.
+
+Las formas canónicas confirmadas son `$type: Vector3` con `x/y/z`, `$type: Color3` con `r/g/b` normalizados, `$type: CFrame` con `components`, y `$type: EnumItem` con `enumType/name`. Tipos sin decoder de escritura no reciben un editor falso y caen en fallback seguro.

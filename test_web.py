@@ -345,6 +345,116 @@ def test_real_blocking_tool_schemas_expose_generic_immutable_editors():
         assert label in view.text and "/agent/draft/" not in view.text
 
 
+def test_typed_property_dispatch_exposes_vector3_color3_and_enum_editors():
+    metadata = {
+        "Size": {"robloxType": "Vector3"},
+        "Position": {"robloxType": "Vector3"},
+        "Color": {"robloxType": "Color3"},
+        "Material": {"robloxType": "EnumItem", "enumType": "Material", "enumValues": [
+            {"$type": "EnumItem", "enumType": "Material", "name": "Grass", "value": 128},
+            {"$type": "EnumItem", "enumType": "Material", "name": "Rock", "value": 512},
+        ]},
+    }
+    store.catalog.tools = [{"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+        "class_name": {"type": "string"},
+        "properties": {"type": "object", "additionalProperties": True, "x-roblox-property-metadata": metadata},
+    }}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    editor = client.get(_link(view.text, "Edit object"))
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Size": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    typed = client.get(_link(editor.text, "Edit Size"))
+    assert "Vector3 Editor" in typed.text
+    assert "Edit X" in typed.text and "Edit Y" in typed.text and "Edit Z" in typed.text
+    assert "Edit as string" not in typed.text and "Edit as number" not in typed.text
+
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Color": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    color = client.get(_link(editor.text, "Edit Color"))
+    assert "Color3 Editor" in color.text and "Edit R" in color.text
+
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Material": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    enum_page = client.get(_link(editor.text, "Edit Material"))
+    assert "Enum Editor" in enum_page.text and "Set Grass" in enum_page.text and "Set Rock" in enum_page.text
+
+
+def test_typed_vector3_value_uses_canonical_snapshot_and_stale_action_is_rejected():
+    metadata = {"Size": {"robloxType": "Vector3"}}
+    store.catalog.tools = [{"name": "studio_set_properties", "inputSchema": {"type": "object", "properties": {
+        "values": {"type": "object", "additionalProperties": True, "x-roblox-property-metadata": metadata},
+    }}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_set_properties")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    editor = client.get(_link(view.text, "Edit object"))
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Size": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    typed = client.get(_link(editor.text, "Edit Size"))
+    stale_link = _link(typed.text, "Edit Y")
+    x = client.get(_link(typed.text, "Edit X"))
+    x = client.get(_link(x.text, "Clear"), follow_redirects=True)
+    for char in "80": x = client.get(_link(x.text, char), follow_redirects=True)
+    typed = client.get(_link(x.text, "Finish"), follow_redirects=True)
+    final_view = client.get(_link(typed.text, "Back to Draft"))
+    assert '&quot;$type&quot;: &quot;Vector3&quot;' in final_view.text
+    assert '&quot;x&quot;: 80' in final_view.text
+    prepared = client.get(_link(final_view.text, "Prepare Execution"), follow_redirects=True)
+    assert '&quot;$type&quot;: &quot;Vector3&quot;' in prepared.text and '&quot;x&quot;: 80' in prepared.text
+    stale = client.get(stale_link, follow_redirects=False)
+    assert stale.status_code == 200
+    assert "STALE DRAFT VIEW" in stale.text
+
+
+def test_batch_nested_property_uses_same_typed_dispatch():
+    item_schema = {"type": "object", "additionalProperties": True, "x-roblox-property-metadata": {"Size": {"robloxType": "Vector3"}}}
+    store.catalog.tools = [{"name": "studio_batch", "inputSchema": {"type": "object", "properties": {
+        "operations": {"type": "array", "items": item_schema},
+    }}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_batch")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    array = client.get(_link(view.text, "Edit array"))
+    operation = client.get(_link(array.text, "Add item"), follow_redirects=True)
+    operation = client.get(_link(operation.text, "Edit item 0"), follow_redirects=True)
+    key = client.get(_link(operation.text, "Add field"), follow_redirects=True)
+    for char in "Size": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    operation = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    typed = client.get(_link(operation.text, "Edit Size"))
+    assert "Vector3 Editor" in typed.text and "Edit X" in typed.text
+
+
+def test_color3_component_range_rejects_invalid_typed_value():
+    metadata = {"Color": {"robloxType": "Color3"}}
+    store.catalog.tools = [{"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+        "properties": {"type": "object", "additionalProperties": True, "x-roblox-property-metadata": metadata},
+    }}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    editor = client.get(_link(view.text, "Edit object"))
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Color": key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    color = client.get(_link(editor.text, "Edit Color"))
+    red = client.get(_link(color.text, "Edit R"))
+    red = client.get(_link(red.text, "Clear"), follow_redirects=True)
+    red = client.get(_link(red.text, "2"), follow_redirects=True)
+    rejected = client.get(_link(red.text, "Finish"), follow_redirects=False)
+    assert rejected.status_code == 400
+    assert "at most 1" in rejected.text
+
+
 def test_prepared_invocation_keeps_snapshot_after_draft_changes_and_executes_once():
     view = client.get(_start_string_draft().request.url)
     view = client.get(_link(view.text, "Set Part"), follow_redirects=True)

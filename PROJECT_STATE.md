@@ -18,6 +18,9 @@
 - Navigator genérico recursivo para objetos, arrays, valores anidados, enums, booleanos y números; incluye edición de claves arbitrarias, propiedades, listas de objetos y snapshots nuevos tras cada mutación.
 - Redirects de Start/Action con `no-store`, `no-cache`, `CDN-Cache-Control` y `Surrogate-Control`; views congelan acciones, candidatos y valores recientes.
 - Relay endurecido: la limpieza de una conexión MCP fallida no puede matar el bucle de reconexión si el SDK lanza `ExceptionGroup`.
+- Resolución typed de propiedades: el bridge/plugin expone `propertyMetadata` derivada de `typeof`, y `studio_get_properties` acepta `class_name` para consultar defaults de una instancia temporal no parentada.
+- Agent Gateway typed: Vector2/Vector3/Color3/CFrame/UDim/UDim2/NumberRange/BrickColor, EnumItem picker y fallback seguro para tipos sin decoder/editor escribible.
+- El mismo dispatch se aplica a `studio_create_instance.properties`, `studio_set_properties.values` y objetos nested de `studio_batch`.
 - Build markers visibles en Agent, health y dashboard: `DEPLOY_COMMIT`, `RENDER_INSTANCE_ID` y `AGENT_PROTOCOL_VERSION=immutable-v1`.
 - Contrato de Instance auditado contra `tools/list`; candidatos recientes conservan `ref`, path estructurado y `displayPath`.
 - El MCP server del bridge corrige la composición de selectors: normaliza snapshots con `id/ref + path` y evita anidarlos como `ref: {id: ...}`.
@@ -31,6 +34,7 @@
 - Render recibió heartbeat: `local_client_online=true`, `mcp_connected=true`, `studio_connected=true`, `tool_count=71`.
 - Tests de recuperación de catálogo: catálogo existente no se reenvía; catálogo ausente se restaura; fallo temporal no termina el cliente.
 - Suite MCP-WEB actual: cubre redirects immutable, snapshots estables, picker congelado, objetos/arrays recursivos y los schemas reales de create/properties/batch.
+- Suite MCP-WEB typed: cubre Vector3, Color3, EnumItem, batch nested, snapshots Prepared, stale actions y rechazo de componentes Color3 fuera de rango.
 - Suite bridge actual: 19 tests pasan.
 - Bridge versionado localmente sin remote: commit `b39972f0ac60383ff920f1875aa1810d7914593d`.
 - Catálogo público: 71 tools e incluye `studio_list_sessions`.
