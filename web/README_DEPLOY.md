@@ -21,4 +21,18 @@ https://mcp-web-xxxx.onrender.com/api/v1/catalog.json
 
 6. Copia esa URL sin la ruta final en `config.json` como `relay_url`, inicia el bridge MCP local y ejecuta `run_relay.bat`.
 
-El estado se guarda en memoria y se pierde al reiniciar el servicio. Los endpoints de catálogo, llamadas, resultados y estado envían `no-store`.
+Por defecto el estado se guarda en memoria para desarrollo local. Para Agent Mode en producción, configura un backend Redis-compatible compartido antes de usar varios workers o depender de enlaces después de un reinicio. Los endpoints de catálogo, llamadas, resultados y estado envían `no-store`.
+
+## Estado compartido de Agent Mode
+
+Añade estas variables en Render (o en el entorno del servicio):
+
+```text
+AGENT_STATE_BACKEND=redis
+AGENT_STATE_URL=<URL-privada-de-Redis-compatible>
+AGENT_STATE_NAMESPACE=mcp-web:agent:immutable-v1
+```
+
+`AGENT_STATE_URL` debe ser un secreto del proveedor de estado; no se guarda en Git. El backend almacena un documento JSON versionado (`agent-state-v1`), aplica TTL y serializa las mutaciones con un lock distribuido más una comprobación CAS. Si el backend configurado no responde, las rutas `/agent/*` fallan cerrado con `503` y no continúan usando memoria local.
+
+El estado visible en `/agent/status`, `/api/v1/health.json` y `/api/v1/dashboard.json` incluye `agent_state_backend`, `shared`, `connected`, `schema_version`, `namespace` y `ttl_seconds` (sin exponer la URL ni credenciales). El TTL compartido predeterminado es 3600 segundos y se renueva con cada petición Agent. Para desarrollo local no hace falta configurar nada: el valor predeterminado es `AGENT_STATE_BACKEND=memory`.

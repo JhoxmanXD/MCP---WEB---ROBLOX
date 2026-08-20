@@ -1,8 +1,11 @@
+import asyncio
 import re
 
 from fastapi.testclient import TestClient
 
 from web.app import app, store
+from web.agent_state import InMemorySharedAgentStateBackend, RedisAgentStateBackend
+from web.store import MemoryStore
 
 
 client = TestClient(app)
@@ -19,7 +22,76 @@ def test_health_and_no_cache():
     response = client.get("/api/v1/health.json")
     assert response.status_code == 200
     assert response.json()["service"] == "MCP-WEB"
+    assert response.json()["agent_state_backend"] == "memory"
+    assert response.json()["agent_state_backend_connected"] is True
     assert response.headers["cache-control"].startswith("no-store")
+
+
+def test_shared_agent_state_survives_restart_and_alternating_clients():
+    backend = InMemorySharedAgentStateBackend("test:alternating")
+    first_worker = MemoryStore()
+    restarted_worker = MemoryStore()
+
+    async def scenario():
+        async with backend.request(first_worker):
+            first_worker.drafts["d_shared"] = {"draft_id": "d_shared", "revision": 0, "created_at": "now"}
+            first_worker.views["V_shared"] = {"view_id": "V_shared", "draft_id": "d_shared", "revision": 0}
+            first_worker.actions["A_shared"] = {"action_id": "A_shared", "draft_id": "d_shared", "view_id": "V_shared", "consumed": False}
+            first_worker.editors["E_shared"] = {"editor_id": "E_shared", "draft_id": "d_shared", "view_id": "V_shared", "value_snapshot": ""}
+            first_worker.prepared["P_shared"] = {"prepare_id": "P_shared", "draft_id": "d_shared", "draft_revision": 0, "executed": False}
+            first_worker.result_views["R_shared"] = {"result_view_id": "R_shared", "draft_id": "d_shared", "status": "pending"}
+            first_worker.recent_refs.append({"ref": "instance://shared"})
+
+        async with backend.request(restarted_worker):
+            assert "A_shared" in restarted_worker.actions
+            assert "E_shared" in restarted_worker.editors
+            assert "P_shared" in restarted_worker.prepared
+            assert "R_shared" in restarted_worker.result_views
+            assert restarted_worker.recent_refs[-1]["ref"] == "instance://shared"
+            restarted_worker.actions["A_shared"]["consumed"] = True
+
+        async with backend.request(first_worker):
+            assert first_worker.actions["A_shared"]["consumed"] is True
+            for index in range(82):
+                first_worker.actions[f"A_{index}"] = {"action_id": f"A_{index}", "draft_id": "d_shared", "view_id": "V_shared", "created_at": str(index)}
+
+        async with backend.request(restarted_worker):
+            assert len(restarted_worker.actions) == 83
+            assert restarted_worker.actions["A_81"]["action_id"] == "A_81"
+
+    asyncio.run(scenario())
+
+
+def test_shared_agent_state_serializes_one_shot_action_consumption():
+    backend = InMemorySharedAgentStateBackend("test:one-shot")
+    seed = MemoryStore()
+    seed.actions["A_once"] = {"action_id": "A_once", "consumed": False}
+
+    async def scenario():
+        async with backend.request(seed):
+            pass
+
+        async def consume(worker):
+            async with backend.request(worker):
+                action = worker.actions["A_once"]
+                if action["consumed"]:
+                    return False
+                action["consumed"] = True
+                return True
+
+        results = await asyncio.gather(consume(MemoryStore()), consume(MemoryStore()))
+        assert sorted(results) == [False, True]
+
+    asyncio.run(scenario())
+
+
+def test_configured_shared_backend_fails_closed_without_url(monkeypatch):
+    import web.app as app_module
+
+    monkeypatch.setattr(app_module, "agent_state_backend", RedisAgentStateBackend(None, "test:missing", 7200, 60))
+    response = client.get("/agent/status")
+    assert response.status_code == 503
+    assert "AGENT STATE BACKEND UNAVAILABLE" in response.text
 
 
 def test_idempotent_call_poll_complete_result_and_state():

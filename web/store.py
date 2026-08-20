@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timezone
 from threading import RLock
 from typing import Any
@@ -31,6 +32,75 @@ class MemoryStore:
         self.prepared: dict[str, dict[str, Any]] = {}
         self.result_views: dict[str, dict[str, Any]] = {}
         self.editors: dict[str, dict[str, Any]] = {}
+
+    def export_agent_state(self) -> dict[str, Any]:
+        """Return JSON-safe workflow state for a shared state backend.
+
+        Agent navigation records and the minimum relay records that feed result
+        views are shared together. This prevents a second worker from seeing a
+        ``R_`` snapshot while missing its job or catalog.
+        """
+        with self.lock:
+            jobs = {
+                request_id: job.model_dump(mode="json")
+                for request_id, job in list(self.jobs.items())[-1024:]
+            }
+            return deepcopy({
+                "jobs": jobs,
+                "queue": [request_id for request_id in self.queue if request_id in jobs],
+                "latest": self.latest,
+                "states": self.states,
+                "catalog": self.catalog.model_dump(mode="json"),
+                "heartbeat": self.heartbeat.model_dump(mode="json") if self.heartbeat else None,
+                "drafts": self.drafts,
+                "recent_refs": self.recent_refs,
+                "recent_string_values": self.recent_string_values,
+                "views": self.views,
+                "actions": self.actions,
+                "prepared": self.prepared,
+                "result_views": self.result_views,
+                "editors": self.editors,
+            })
+
+    def import_agent_state(self, state: dict[str, Any]) -> None:
+        """Replace Agent Mode collections after validating JSON shape."""
+        if not isinstance(state, dict):
+            raise ValueError("agent state must be a JSON object")
+        collections = (
+            "jobs", "queue", "latest", "states", "catalog", "heartbeat",
+            "drafts", "recent_refs", "recent_string_values", "views",
+            "actions", "prepared", "result_views", "editors",
+        )
+        for name in collections:
+            default = [] if name in {"queue", "recent_refs", "recent_string_values"} else None if name == "heartbeat" else {}
+            value = state.get(name, default)
+            if name in {"queue", "recent_refs", "recent_string_values"}:
+                if not isinstance(value, list):
+                    raise ValueError(f"agent state field {name} must be a list")
+            elif name == "heartbeat":
+                if value is not None and not isinstance(value, dict):
+                    raise ValueError("agent state field heartbeat must be an object or null")
+            elif name == "latest":
+                if value is not None and not isinstance(value, dict):
+                    raise ValueError("agent state field latest must be an object or null")
+            elif not isinstance(value, dict):
+                raise ValueError(f"agent state field {name} must be an object")
+        with self.lock:
+            self.jobs = {request_id: Job(**job) for request_id, job in state.get("jobs", {}).items()}
+            self.queue = deque(request_id for request_id in state.get("queue", []) if request_id in self.jobs)
+            self.latest = deepcopy(state.get("latest"))
+            self.states = deepcopy(state.get("states", {}))
+            self.catalog = Catalog(**state.get("catalog", {}))
+            heartbeat = state.get("heartbeat")
+            self.heartbeat = Heartbeat(**heartbeat) if heartbeat else None
+            self.drafts = deepcopy(state.get("drafts", {}))
+            self.recent_refs = deepcopy(state.get("recent_refs", []))
+            self.recent_string_values = deepcopy(state.get("recent_string_values", []))
+            self.views = deepcopy(state.get("views", {}))
+            self.actions = deepcopy(state.get("actions", {}))
+            self.prepared = deepcopy(state.get("prepared", {}))
+            self.result_views = deepcopy(state.get("result_views", {}))
+            self.editors = deepcopy(state.get("editors", {}))
 
     def create_job(self, job: Job) -> Job:
         with self.lock:

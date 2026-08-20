@@ -44,4 +44,4 @@ Las acciones inmutables registran ownership hacia `draft_id` y `view_id`/editor/
 
 Los eventos `ACTION_CREATED`, `ACTION_LOOKUP` y `AGENT_STATE_EXPIRED` incluyen IDs opacos, revisión, store id, process id e instance id, sin argumentos sensibles. Un estado ausente se comunica como `410 AGENT STATE EXPIRED`, no como un 404 genérico.
 
-El despliegue documentado es un único proceso uvicorn con `MemoryStore`. Soporta el lifecycle dentro del mismo proceso; multi-worker o multi-instance requiere backend compartido y operaciones atómicas antes de considerarse soportado.
+El modo local usa `MemoryStore`; producción puede activar `AGENT_STATE_BACKEND=redis` y `AGENT_STATE_URL`. El backend compartido usa JSON `agent-state-v1`, namespace, TTL, lock distribuido y CAS de revisión para conservar Views, Actions, editors, Prepared, Result y los jobs/catálogo mínimos entre workers. El status publica `agent_state_backend` sin credenciales y el sistema falla cerrado con `503` si el backend configurado no responde.

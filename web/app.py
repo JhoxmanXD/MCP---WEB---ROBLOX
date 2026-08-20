@@ -16,20 +16,63 @@ try:
     from .protocol import parse_arguments
     from .store import MemoryStore
     from .agent import register_agent_routes
+    from .agent_state import AgentStateConflict as AgentStateBackendConflict, AgentStateBackendError, AgentStateBackendUnavailable, AgentStateIncompatible, build_agent_state_backend
     from .build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 except ImportError:  # Render runs `uvicorn app:app` from web/
     from models import Catalog, Heartbeat, Job
     from protocol import parse_arguments
     from store import MemoryStore
     from agent import register_agent_routes
+    from agent_state import AgentStateConflict as AgentStateBackendConflict, AgentStateBackendError, AgentStateBackendUnavailable, AgentStateIncompatible, build_agent_state_backend
     from build_info import AGENT_PROTOCOL_VERSION, DEPLOY_COMMIT, RENDER_INSTANCE_ID
 
 app = FastAPI(title="MCP-WEB", version="0.1.0")
 store = MemoryStore()
+agent_state_backend = build_agent_state_backend()
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 READ_WAIT_SECONDS = 8.0
-register_agent_routes(app, store, lambda: current_studio_connected())
+
+
+def _agent_state_error_response(status_code: int, title: str, detail: str) -> HTMLResponse:
+    response = HTMLResponse(
+        f"<!doctype html><html><head><meta charset='utf-8'><title>{escape(title)}</title></head>"
+        f"<body><h1>{escape(title)}</h1><p>{escape(detail)}</p><p>Agent Mode is fail-closed until the configured shared state backend is available.</p>"
+        f"<p><a href='/agent/status'>Agent Status</a></p></body></html>",
+        status_code=status_code,
+    )
+    response.headers.update({"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
+    return response
+
+
+@app.middleware("http")
+async def shared_agent_state(request: Request, call_next):
+    path = request.url.path
+    is_agent_request = path == "/agent" or path.startswith("/agent/")
+    is_workflow_request = (
+        is_agent_request
+        or path in {"/api/v1/catalog", "/api/v1/catalog.json", "/api/v1/client/heartbeat", "/api/v1/dashboard.json"}
+        or path.startswith("/api/v1/call/")
+        or path.startswith("/api/v1/jobs/")
+        or path.startswith("/api/v1/result/")
+        or path.startswith("/api/v1/state/")
+    )
+    if not is_workflow_request or not agent_state_backend.shared:
+        return await call_next(request)
+    try:
+        async with agent_state_backend.request(store):
+            return await call_next(request)
+    except AgentStateBackendUnavailable as exc:
+        return _agent_state_error_response(503, "AGENT STATE BACKEND UNAVAILABLE", str(exc))
+    except AgentStateIncompatible as exc:
+        return _agent_state_error_response(500, "AGENT STATE SCHEMA INCOMPATIBLE", str(exc))
+    except AgentStateBackendConflict as exc:
+        return _agent_state_error_response(409, "AGENT STATE CONFLICT", str(exc))
+    except AgentStateBackendError as exc:
+        return _agent_state_error_response(503, "AGENT STATE ERROR", str(exc))
+
+
+register_agent_routes(app, store, lambda: current_studio_connected(), lambda: agent_state_backend.status())
 
 
 def no_cache(response: JSONResponse) -> JSONResponse:
@@ -69,7 +112,8 @@ async def dashboard() -> FileResponse:
 @app.get("/read/health", response_class=HTMLResponse)
 async def read_health() -> HTMLResponse:
     heartbeat = store.heartbeat
-    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected and store.online())).lower()}</p><p><strong>studio_connected:</strong> {str(current_studio_connected()).lower()}</p><p><strong>DEPLOY_COMMIT:</strong> <code>{escape(DEPLOY_COMMIT)}</code></p><p><strong>RENDER_INSTANCE_ID:</strong> <code>{escape(RENDER_INSTANCE_ID)}</code></p><p><strong>AGENT_PROTOCOL_VERSION:</strong> <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
+    backend = agent_state_backend.status()
+    body = f"<h1>MCP-WEB HEALTH</h1><p><strong>local_client_online:</strong> {str(store.online()).lower()}</p><p><strong>mcp_connected:</strong> {str(bool(heartbeat and heartbeat.mcp_connected and store.online())).lower()}</p><p><strong>studio_connected:</strong> {str(current_studio_connected()).lower()}</p><p><strong>agent_state_backend:</strong> {escape(str(backend.get('mode')))}</p><p><strong>agent_state_shared:</strong> {str(bool(backend.get('shared'))).lower()}</p><p><strong>agent_state_connected:</strong> {str(bool(backend.get('connected'))).lower()}</p><p><strong>agent_state_schema_version:</strong> {escape(str(backend.get('schema_version')))}</p><p><strong>DEPLOY_COMMIT:</strong> <code>{escape(DEPLOY_COMMIT)}</code></p><p><strong>RENDER_INSTANCE_ID:</strong> <code>{escape(RENDER_INSTANCE_ID)}</code></p><p><strong>AGENT_PROTOCOL_VERSION:</strong> <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p><a href='/'>Home</a> · <a href='/read/catalog'>Live Catalog</a> · <a href='/read/sessions'>Read Studio Sessions</a></p>"
     return html_page("MCP-WEB Health", body)
 
 
@@ -125,7 +169,8 @@ async def read_latest() -> HTMLResponse:
 @app.get("/api/v1/health")
 @app.get("/api/v1/health.json")
 async def health() -> JSONResponse:
-    return payload({"ok": True, "service": "MCP-WEB", "version": "0.1.0", "local_client_online": store.online(), "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION})
+    backend = agent_state_backend.status()
+    return payload({"ok": True, "service": "MCP-WEB", "version": "0.1.0", "local_client_online": store.online(), "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "agent_state_backend": backend.get("mode"), "agent_state_backend_connected": bool(backend.get("connected")), "agent_state_schema_version": backend.get("schema_version"), "agent_state": backend})
 
 
 @app.get("/api/v1/catalog.json")
@@ -206,4 +251,5 @@ async def state(state_key: str) -> JSONResponse:
 
 @app.get("/api/v1/dashboard.json")
 async def dashboard_data() -> JSONResponse:
-    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})
+    backend = agent_state_backend.status()
+    return payload({"health": True, "local_client_online": store.online(), "studio_connected": current_studio_connected(), "tool_count": store.catalog.tool_count, "server_instance_id": store.catalog.server_instance_id, "catalog_generation": store.catalog.catalog_generation, "deploy_commit": DEPLOY_COMMIT, "render_instance_id": RENDER_INSTANCE_ID, "agent_protocol_version": AGENT_PROTOCOL_VERSION, "agent_state_backend": backend.get("mode"), "agent_state_backend_connected": bool(backend.get("connected")), "agent_state_schema_version": backend.get("schema_version"), "agent_state": backend, "active_drafts": sum(not draft.get("executed") for draft in store.drafts.values()), "counts": store.counts(), "recent_jobs": store.recent(), "heartbeat": store.heartbeat.model_dump(mode="json") if store.heartbeat else None})

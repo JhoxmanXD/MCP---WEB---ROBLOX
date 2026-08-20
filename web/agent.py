@@ -144,7 +144,7 @@ def agent_redirect(path: str, status_code: int = 303) -> RedirectResponse:
     return response
 
 
-def register_agent_routes(app, store, current_studio_connected):
+def register_agent_routes(app, store, current_studio_connected, agent_state_status=None):
     DRAFT_TTL_SECONDS = 3600
 
     def lifecycle_context() -> dict[str, str]:
@@ -769,7 +769,9 @@ def register_agent_routes(app, store, current_studio_connected):
     async def agent_status():
         context = lifecycle_context()
         heartbeat = store.heartbeat.model_dump(mode="json") if store.heartbeat else {}
-        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>STORE_ID: <code>{escape(context['store_id'])}</code></p><p>PROCESS_ID: <code>{escape(context['process_id'])}</code></p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
+        backend = agent_state_status() if agent_state_status else {"mode": "memory", "shared": False, "connected": True}
+        backend_text = escape(json.dumps(backend, ensure_ascii=False, sort_keys=True))
+        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>AGENT_STATE_BACKEND: <code>{escape(str(backend.get('mode')))}</code></p><p>AGENT_STATE_SHARED: <code>{str(bool(backend.get('shared'))).lower()}</code></p><p>AGENT_STATE_CONNECTED: <code>{str(bool(backend.get('connected'))).lower()}</code></p><p>AGENT_STATE_STATUS: <code>{backend_text}</code></p><p>STORE_ID: <code>{escape(context['store_id'])}</code></p><p>PROCESS_ID: <code>{escape(context['process_id'])}</code></p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
         return agent_page("Agent Status", body)
 
     @app.get("/agent/tools", response_class=HTMLResponse)
