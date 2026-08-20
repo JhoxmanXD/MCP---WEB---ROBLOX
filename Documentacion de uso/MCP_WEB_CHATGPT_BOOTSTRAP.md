@@ -1031,4 +1031,4 @@ El gateway usa esa metadata para dispatch typed en `properties`, `values` y obje
 - `EnumItem`: picker de valores reales, JSON `$type: EnumItem` con `enumType/name`.
 - `CFrame`, `Vector2`, `UDim`, `UDim2`, `NumberRange` y `BrickColor`: typed solo cuando la metadata confirma el tipo y existe decoder escribible.
 
-La herencia se resuelve en Roblox mediante la clase real; MCP-WEB no duplica un mapa de propiedades por subclase. Cuando no existe metadata o el tipo no tiene decoder/editor escribible, se muestra un fallback explícito y no se inventa una serialización.
+La herencia se resuelve en Roblox mediante la clase real. Como continuidad segura durante el reinicio de un plugin antiguo, MCP-WEB tiene además un fallback auditado limitado a `BasePart.Size`, `Position`, `Color`, `Material`, `Anchored` y `CanCollide`, heredado por clases conocidas como `Part` y `SpawnLocation`; fuera de ese conjunto no adivina. Cuando no existe metadata ni contrato auditado, o el tipo no tiene decoder/editor escribible, se muestra un fallback explícito y no se inventa una serialización.

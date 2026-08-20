@@ -66,6 +66,48 @@ def typed_schema(value_type: str, metadata: dict[str, Any] | None = None) -> dic
     return schema
 
 
+# These are the property contracts confirmed from the Roblox bridge.  The
+# table is intentionally small: dynamic bridge metadata remains authoritative
+# for everything not listed here, and unknown properties keep the generic
+# fallback instead of being guessed.
+ROBLOX_CLASS_ANCESTORS: dict[str, tuple[str, ...]] = {
+    "Part": ("BasePart", "PVInstance", "Instance"),
+    "SpawnLocation": ("Part", "BasePart", "PVInstance", "Instance"),
+    "MeshPart": ("BasePart", "PVInstance", "Instance"),
+    "WedgePart": ("Part", "BasePart", "PVInstance", "Instance"),
+    "CornerWedgePart": ("Part", "BasePart", "PVInstance", "Instance"),
+    "TrussPart": ("Part", "BasePart", "PVInstance", "Instance"),
+    "Seat": ("Part", "BasePart", "PVInstance", "Instance"),
+    "VehicleSeat": ("Seat", "Part", "BasePart", "PVInstance", "Instance"),
+}
+
+ROBLOX_KNOWN_PROPERTY_TYPES: dict[str, dict[str, str]] = {
+    "BasePart": {
+        "Size": "Vector3",
+        "Position": "Vector3",
+        "Color": "Color3",
+        "Material": "EnumItem",
+        "Anchored": "boolean",
+        "CanCollide": "boolean",
+    },
+}
+
+
+def known_property_schema(class_name: str | None, property_name: str) -> dict[str, Any] | None:
+    """Resolve only audited class/property pairs, including inheritance."""
+    if not isinstance(class_name, str) or not class_name:
+        return None
+    classes = (class_name,) + ROBLOX_CLASS_ANCESTORS.get(class_name, ())
+    for class_key in classes:
+        value_type = ROBLOX_KNOWN_PROPERTY_TYPES.get(class_key, {}).get(property_name)
+        if value_type:
+            metadata = {"robloxType": value_type}
+            if value_type == "EnumItem" and property_name == "Material":
+                metadata["enumType"] = "Material"
+            return typed_schema(value_type, metadata)
+    return None
+
+
 def nullable(schema: dict[str, Any]) -> bool:
     return any(option.get("type") == "null" for option in schema.get("anyOf", []) + schema.get("oneOf", [])) or schema.get("type") == "null"
 
@@ -505,6 +547,13 @@ def register_agent_routes(app, store, current_studio_connected):
                     cache[name] = copy.deepcopy(hints[name])
             missing_names = [name for name in missing_names if name not in cache]
         context = property_context(draft, object_path)
+        # Keep audited contracts aside until live metadata has had a chance to
+        # enrich them (especially EnumItem values).
+        known_fallbacks: dict[str, dict[str, Any]] = {}
+        for name in list(missing_names):
+            known = known_property_schema(context.get("class_name"), name)
+            if known:
+                known_fallbacks[name] = known
         if missing_names and (context.get("ref") is not None or context.get("class_name")):
             tool_name = "studio_get_properties" if "studio_get_properties" in catalog_tools() else "properties"
             request: dict[str, Any] = {"names": missing_names}
@@ -523,21 +572,43 @@ def register_agent_routes(app, store, current_studio_connected):
                     elif name in values:
                         cache[name] = {"value": copy.deepcopy(values[name])}
             if missing_names and context.get("class_name") and tool_name == "studio_get_properties" and "studio_find_instances" in catalog_tools():
-                sample_job = await discover("studio_find_instances", {"query": "", "class_name": context["class_name"], "limit": 1})
-                samples = result_data(sample_job.get("result")) if isinstance(sample_job, dict) and sample_job.get("status") == "completed" else None
-                if isinstance(samples, list) and samples and isinstance(samples[0], dict):
-                    sample_ref = samples[0].get("ref") or samples[0].get("id") or samples[0].get("path")
-                    if sample_ref:
-                        sample_properties = await discover("studio_get_properties", {"ref": sample_ref, "names": missing_names})
-                        sample_data = result_data(sample_properties.get("result")) if isinstance(sample_properties, dict) and sample_properties.get("status") == "completed" else None
-                        if isinstance(sample_data, dict):
-                            metadata = sample_data.get("propertyMetadata") or sample_data.get("property_metadata") or {}
-                            values = sample_data.get("properties") or {}
-                            for name in missing_names:
-                                if name in metadata:
-                                    cache[name] = copy.deepcopy(metadata[name])
-                                elif name in values:
-                                    cache[name] = {"value": copy.deepcopy(values[name])}
+                sample_requests = [
+                    {"query": "", "class_name": context["class_name"], "limit": 1},
+                    {"query": "", "limit": 1},
+                ]
+                for sample_request in sample_requests:
+                    sample_job = await discover("studio_find_instances", sample_request)
+                    samples = result_data(sample_job.get("result")) if isinstance(sample_job, dict) and sample_job.get("status") == "completed" else None
+                    if not (isinstance(samples, list) and samples and isinstance(samples[0], dict)):
+                        continue
+                    sample = samples[0]
+                    # The bridge distinguishes an issued id from a path.  Do
+                    # not send the display ref as a bare string, which would
+                    # be parsed as a path by the MCP server.
+                    sample_ref = {"id": sample["ref"]} if isinstance(sample.get("ref"), str) else None
+                    if sample_ref is None and isinstance(sample.get("id"), str):
+                        sample_ref = {"id": sample["id"]}
+                    if sample_ref is None and isinstance(sample.get("path"), (str, list)):
+                        sample_ref = {"path": sample["path"]}
+                    if sample_ref is None:
+                        continue
+                    sample_properties = await discover("studio_get_properties", {"ref": sample_ref, "names": missing_names})
+                    sample_data = result_data(sample_properties.get("result")) if isinstance(sample_properties, dict) and sample_properties.get("status") == "completed" else None
+                    if isinstance(sample_data, dict):
+                        metadata = sample_data.get("propertyMetadata") or sample_data.get("property_metadata") or {}
+                        values = sample_data.get("properties") or {}
+                        for name in missing_names:
+                            if name in metadata:
+                                cache[name] = copy.deepcopy(metadata[name])
+                            elif name in values:
+                                cache[name] = {"value": copy.deepcopy(values[name])}
+                    if any(name in cache for name in missing_names):
+                        break
+        # Use only audited contracts as a deterministic offline fallback.  A
+        # live bridge response above always wins and supplies enum members.
+        for name, known in known_fallbacks.items():
+            if name not in cache:
+                cache[name] = copy.deepcopy(known)
         result: dict[str, dict[str, Any]] = {}
         for name in names:
             typed = property_schema_from_metadata(cache.get(name))

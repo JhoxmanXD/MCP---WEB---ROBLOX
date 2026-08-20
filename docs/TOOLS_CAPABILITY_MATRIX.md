@@ -34,6 +34,6 @@ La matriz es deliberadamente honesta: listar y describir una tool es dinámico p
 
 ## Property metadata y editores typed
 
-El bridge/plugin es la fuente de verdad de los tipos Roblox. `studio_get_properties` devuelve valores `$type` y `propertyMetadata`; con `class_name` puede describir defaults de una clase sin parentar una instancia. MCP-WEB no mantiene un mapa `Part → propiedades`: la herencia se resuelve en Roblox.
+El bridge/plugin es la fuente de verdad de los tipos Roblox. `studio_get_properties` devuelve valores `$type` y `propertyMetadata`; con `class_name` puede describir defaults de una clase sin parentar una instancia. MCP-WEB conserva únicamente un fallback auditado y pequeño para propiedades `BasePart` confirmadas, aplicándolo también a `SpawnLocation` y descendientes conocidos; no mantiene un catálogo general de subclases ni adivina propiedades.
 
 Las formas canónicas confirmadas son `$type: Vector3` con `x/y/z`, `$type: Color3` con `r/g/b` normalizados, `$type: CFrame` con `components`, y `$type: EnumItem` con `enumType/name`. Tipos sin decoder de escritura no reciben un editor falso y caen en fallback seguro.

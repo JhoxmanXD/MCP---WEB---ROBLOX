@@ -385,6 +385,35 @@ def test_typed_property_dispatch_exposes_vector3_color3_and_enum_editors():
     assert "Enum Editor" in enum_page.text and "Set Grass" in enum_page.text and "Set Rock" in enum_page.text
 
 
+def test_audited_basepart_types_and_spawnlocation_inheritance_work_without_live_metadata():
+    store.catalog.tools = [{"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+        "class_name": {"type": "string"},
+        "properties": {"type": "object", "additionalProperties": True},
+    }}}]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    view = client.get(client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False).headers["location"])
+    class_name = client.get(_link(view.text, "Open String Composer (class_name)"))
+    for char in "SpawnLocation":
+        class_name = client.get(_link(class_name.text, f"Append {char}"), follow_redirects=True)
+    view = client.get(_link(class_name.text, "Finish"), follow_redirects=True)
+    editor = client.get(_link(view.text, "Edit object"))
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Position":
+        key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    typed = client.get(_link(editor.text, "Edit Position"))
+    assert "Vector3 Editor" in typed.text
+    assert "Edit X" in typed.text and "Edit Y" in typed.text and "Edit Z" in typed.text
+
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Anchored":
+        key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    boolean = client.get(_link(editor.text, "Edit Anchored"))
+    assert "Set true" in boolean.text and "Set false" in boolean.text
+
+
 def test_typed_vector3_value_uses_canonical_snapshot_and_stale_action_is_rejected():
     metadata = {"Size": {"robloxType": "Vector3"}}
     store.catalog.tools = [{"name": "studio_set_properties", "inputSchema": {"type": "object", "properties": {

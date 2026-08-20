@@ -2896,4 +2896,4 @@ Representaciones canónicas:
 { "$type": "EnumItem", "enumType": "Material", "name": "Grass" }
 ```
 
-El Schema Navigator usa editores typed para metadata conocida y conserva el editor genérico únicamente como fallback explícito. `create_instance.properties`, `set_properties.values` y propiedades dentro de `batch` comparten el mismo dispatch immutable, con protección stale/replay y snapshots Prepared exactos.
+El Schema Navigator usa editores typed para metadata conocida y conserva el editor genérico únicamente como fallback explícito. Durante la transición de un plugin antiguo existe solo un resolver auditado para `BasePart.Size`, `Position`, `Color`, `Material`, `Anchored` y `CanCollide`, heredado por clases conocidas como `Part` y `SpawnLocation`; no se infieren otras propiedades. `create_instance.properties`, `set_properties.values` y propiedades dentro de `batch` comparten el mismo dispatch immutable, con protección stale/replay y snapshots Prepared exactos.
