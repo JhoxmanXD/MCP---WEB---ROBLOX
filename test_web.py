@@ -204,7 +204,8 @@ def test_backend_identity_hash_is_stable_without_exposing_redis_secret():
     assert status["state_key"] == "forensic:identity:state"
 
 
-def test_redis_restart_survival_runs_startup_hook_then_follows_action():
+def test_redis_restart_survival_runs_startup_hook_then_follows_action(caplog):
+    caplog.set_level("WARNING", logger="mcp-web.agent_state")
     namespace = "forensic:restart"
     redis = _ForensicRedis()
     backend_a = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
@@ -223,6 +224,7 @@ def test_redis_restart_survival_runs_startup_hook_then_follows_action():
                 "consumed": False, "created_at": "now", "expires_at": "2099-01-01T00:00:00+00:00",
                 "state_schema_version": "agent-state-v1",
             }
+            worker_a.pending_agent_action_ids.add("A_restart")
 
         state_key = backend_a.key
         state_before = redis.values[state_key]
@@ -255,8 +257,29 @@ def test_redis_restart_survival_runs_startup_hook_then_follows_action():
         await backend_b._load(redis, worker_c)
         assert worker_c.actions["A_restart"]["consumed"] is True
         assert ttl_before > 0
+        assert "ACTION_PERSISTED action_id=A_restart persisted=true" in caplog.text
+        assert "redis://" not in caplog.text
 
     asyncio.run(scenario())
+
+
+def test_agent_lifecycle_events_are_warning_visible_without_secrets(caplog):
+    caplog.set_level("WARNING", logger="mcp-web.agent")
+    draft_page = _start_string_draft()
+    action_url = _link(draft_page.text, "Set Part")
+    action_id = action_url.rsplit("/", 1)[-1]
+
+    response = client.get(action_url, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert f"ACTION_CREATED action_id={action_id}" in caplog.text
+    assert f"ACTION_LOOKUP action_id={action_id} exists=true" in caplog.text
+    assert "backend_identity_hash=" in caplog.text
+    assert "redis_db=" in caplog.text
+    assert "namespace=" in caplog.text
+    assert "state_key=" in caplog.text
+    assert "redis://" not in caplog.text
+    assert "super-secret" not in caplog.text
 
 
 def test_redis_lock_and_cas_preserve_updates_from_two_clients():

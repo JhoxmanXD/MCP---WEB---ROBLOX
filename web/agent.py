@@ -189,11 +189,11 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 store.actions[action["action_id"]] = action
         context = lifecycle_context()
         backend = backend_context()
-        logger.info(
-            "ACTION_CREATED action_id=%s draft_id=%s view_id=%s expected_revision=%s operation=%s created_at=%s store_id=%s process_id=%s instance_id=%s process=%s render_instance=%s backend_identity_hash=%s redis_db=%s namespace=%s state_key=%s persisted=pending state_backend=%s",
-            action["action_id"], action.get("draft_id"), action.get("view_id"),
+        logger.warning(
+            "ACTION_CREATED action_id=%s draft_id=%s view_id=%s editor_id=%s expected_revision=%s operation=%s created_at=%s request_id=%s store_id=%s process_id=%s instance_id=%s process=%s render_instance=%s backend_identity_hash=%s redis_db=%s namespace=%s state_key=%s persisted=pending state_backend=%s",
+            action["action_id"], action.get("draft_id"), action.get("view_id", "none"), action.get("editor_id", "none"),
             action.get("expected_revision"), action.get("operation"), action.get("created_at"),
-            context["store_id"], context["process_id"], context["instance_id"],
+            action.get("request_id", "unknown"), context["store_id"], context["process_id"], context["instance_id"],
             context["process_id"], context["instance_id"], backend["backend_identity_hash"], backend["redis_db"],
             backend["namespace"], backend["state_key"],
             (agent_state_status() if agent_state_status else {}).get("mode", "memory"),
@@ -223,11 +223,11 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         backend = agent_state_status() if agent_state_status else {}
         diagnostic = backend_context()
         logger.warning(
-            "ACTION_LOOKUP action_id=%s exists=no reason=ACTION_KEY_MISSING redis_key=%s state_key=%s namespace=%s backend_identity_hash=%s redis_db=%s store_id=%s process_id=%s instance_id=%s process=%s render_instance=%s action_count=%s drafts=%s views=%s draft_exists=no view_exists=no deserialize_status=not-found redis_ttl=%s",
-            action_id, diagnostic["state_key"], diagnostic["state_key"], diagnostic["namespace"], diagnostic["backend_identity_hash"], diagnostic["redis_db"],
-            context["store_id"], context["process_id"], context["instance_id"],
-            context["process_id"], context["instance_id"], len(store.actions), len(store.drafts), len(store.views),
-            getattr(store, "agent_state_observed_ttl", "unknown"),
+            "ACTION_LOOKUP action_id=%s exists=false reason=ACTION_KEY_MISSING redis_key=%s state_key=%s redis_ttl=%s deserialize_status=not-found draft_exists=false view_exists=false owner_exists=false consumed=unknown resulting_url=none namespace=%s backend_identity_hash=%s redis_db=%s request_id=unknown store_id=%s process_id=%s instance_id=%s process=%s render_instance=%s action_count=%s drafts=%s views=%s",
+            action_id, diagnostic["state_key"], diagnostic["state_key"], getattr(store, "agent_state_observed_ttl", "unknown"),
+            diagnostic["namespace"], diagnostic["backend_identity_hash"], diagnostic["redis_db"],
+            context["store_id"], context["process_id"], context["instance_id"], context["process_id"], context["instance_id"],
+            len(store.actions), len(store.drafts), len(store.views),
         )
         return expired_state("action", action_id, "ACTION_KEY_MISSING")
 
@@ -308,7 +308,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         context = lifecycle_context()
         if before_hash == after_hash:
             refresh_deadline(draft)
-            logger.info(
+            logger.warning(
                 "DRAFT_REVISION_UNCHANGED draft_id=%s revision=%s reason=%s action_id=%s operation=%s arguments_hash=%s process=%s instance=%s",
                 draft["draft_id"], revision_before, reason, action_id, operation,
                 after_hash, context["process_id"], context["instance_id"],
@@ -316,7 +316,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             return False
         draft["revision"] = revision_before + 1
         refresh_deadline(draft)
-        logger.info(
+        logger.warning(
             "DRAFT_REVISION_ADVANCED draft_id=%s revision_before=%s revision_after=%s reason=%s action_id=%s operation=%s arguments_hash_before=%s arguments_hash_after=%s process=%s instance=%s",
             draft["draft_id"], revision_before, draft["revision"], reason, action_id, operation,
             before_hash, after_hash, context["process_id"], context["instance_id"],
@@ -889,18 +889,19 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             return missing_action(action_id)
         context = lifecycle_context()
         diagnostic = backend_context()
-        logger.info(
-            "ACTION_LOOKUP action_id=%s exists=yes reason=FOUND redis_key=%s state_key=%s redis_ttl=%s namespace=%s backend_identity_hash=%s redis_db=%s store_id=%s process_id=%s instance_id=%s process=%s render_instance=%s action_count=%s draft_id=%s view_id=%s draft_exists=%s view_exists=%s expected_revision=%s consumed=%s deserialize_status=ok method=%s request_id=%s user_agent=%s referer=%s",
+        draft_exists = action.get("draft_id") in store.drafts
+        view_exists = not action.get("view_id") or action.get("view_id") in store.views
+        owner_exists = draft_exists and view_exists
+        logger.warning(
+            "ACTION_LOOKUP action_id=%s exists=true reason=FOUND redis_key=%s state_key=%s redis_ttl=%s deserialize_status=ok draft_exists=%s view_exists=%s owner_exists=%s consumed=%s resulting_url=%s namespace=%s backend_identity_hash=%s redis_db=%s request_id=%s store_id=%s process_id=%s instance_id=%s process=%s render_instance=%s action_count=%s draft_id=%s view_id=%s expected_revision=%s method=%s user_agent=%s referer=%s",
             action_id,
             diagnostic["state_key"], diagnostic["state_key"],
             getattr(store, "agent_state_observed_ttl", "unknown"),
-            diagnostic["namespace"], diagnostic["backend_identity_hash"], diagnostic["redis_db"],
-            context["store_id"], context["process_id"], context["instance_id"],
-            context["process_id"], context["instance_id"],
-            len(store.actions), action.get("draft_id"), action.get("view_id"),
-            action.get("draft_id") in store.drafts, action.get("view_id") in store.views,
-            action.get("expected_revision"), action.get("consumed"),
-            request_info["method"], request_info["request_id"], request_info["user_agent"], request_info["referer"],
+            draft_exists, view_exists, owner_exists, action.get("consumed"), action.get("resulting_url") or "none",
+            diagnostic["namespace"], diagnostic["backend_identity_hash"], diagnostic["redis_db"], request_info["request_id"],
+            context["store_id"], context["process_id"], context["instance_id"], context["process_id"], context["instance_id"],
+            len(store.actions), action.get("draft_id"), action.get("view_id", "none"), action.get("expected_revision"),
+            request_info["method"], request_info["user_agent"], request_info["referer"],
         )
         if action.get("consumed"):
             target = action.get("resulting_url")

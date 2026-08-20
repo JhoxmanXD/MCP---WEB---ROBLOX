@@ -441,11 +441,12 @@ class SharedAgentStateStore(AgentStateStore):
             if redis_ttl <= 0:
                 raise AgentStateBackendUnavailable(f"shared state key has invalid TTL {redis_ttl}")
             for action_id in getattr(store, "pending_agent_action_ids", set()):
-                logger.info(
-                    "ACTION_PERSISTED action_id=%s redis_key=%s state_key=%s record_path=%s/%s redis_ttl=%s persisted=true namespace=%s backend_identity_hash=%s redis_db=%s process=%s render_instance=%s process_id=%s instance_id=%s store_id=%s",
-                    action_id, key_for_action(self.namespace, action_id).redis_key,
+                logger.warning(
+                    "ACTION_PERSISTED action_id=%s persisted=true state_key_exists=true redis_ttl=%s drafts_count=%s views_count=%s actions_count=%s redis_key=%s state_key=%s record_path=%s/%s namespace=%s backend_identity_hash=%s redis_db=%s process=%s render_instance=%s process_id=%s instance_id=%s store_id=%s",
+                    action_id, redis_ttl, len(persisted["state"].get("drafts", {})), len(persisted["state"].get("views", {})), len(persisted["state"].get("actions", {})),
                     key_for_action(self.namespace, action_id).redis_key,
-                    *key_for_action(self.namespace, action_id).record_path, redis_ttl, self.namespace,
+                    key_for_action(self.namespace, action_id).redis_key,
+                    *key_for_action(self.namespace, action_id).record_path, self.namespace,
                     self._backend_identity()[0], self._backend_identity()[1], os.getpid(), os.getenv("RENDER_INSTANCE_ID", "unknown"),
                     os.getpid(), os.getenv("RENDER_INSTANCE_ID", "unknown"),
                     getattr(store, "server_instance_id", "unknown"),
