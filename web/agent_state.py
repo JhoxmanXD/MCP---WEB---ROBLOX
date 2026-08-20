@@ -9,6 +9,7 @@ lock. No pickle/eval or application objects cross the storage boundary.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 
@@ -181,6 +183,9 @@ class AgentStateStore:
     async def roundtrip(self) -> bool:
         return bool(self.status().get("connected"))
 
+    async def startup_diagnostics(self, phase: str) -> dict[str, Any]:
+        return {"phase": phase, "state_key_exists": None, "ttl": None, "drafts": None, "views": None, "actions": None}
+
     @asynccontextmanager
     async def request(self, store: Any) -> AsyncIterator[None]:
         raise NotImplementedError
@@ -271,6 +276,7 @@ class SharedAgentStateStore(AgentStateStore):
         self._roundtrip: bool | None = None
 
     def status(self) -> dict[str, Any]:
+        identity_hash, database = self._backend_identity()
         result = {
             "mode": self.mode,
             "shared": True,
@@ -279,6 +285,8 @@ class SharedAgentStateStore(AgentStateStore):
             "schema_version": AGENT_STATE_SCHEMA_VERSION,
             "namespace": self.namespace,
             "state_key": self.key,
+            "backend_identity_hash": identity_hash,
+            "redis_db": database,
             "ttl_seconds": self.ttl_seconds,
             "roundtrip": self._roundtrip,
         }
@@ -318,6 +326,60 @@ class SharedAgentStateStore(AgentStateStore):
             self._last_error = f"{type(exc).__name__}: {exc}"
             self._roundtrip = False
         return bool(self._roundtrip)
+
+    def _backend_identity(self) -> tuple[str, str]:
+        if not self.url:
+            return "unknown", "unknown"
+        parsed = urlsplit(self.url)
+        safe_identity = f"{parsed.scheme}://{parsed.hostname or 'unknown'}:{parsed.port or 'default'}{parsed.path or ''}"
+        identity_hash = hashlib.sha256(safe_identity.encode()).hexdigest()[:16]
+        database = "unknown"
+        path_part = (parsed.path or "").strip("/")
+        if path_part.isdigit():
+            database = path_part
+        else:
+            query_db = parse_qs(parsed.query).get("db", [])
+            if query_db and query_db[0].isdigit():
+                database = query_db[0]
+        return identity_hash, database
+
+    async def startup_diagnostics(self, phase: str) -> dict[str, Any]:
+        identity_hash, database = self._backend_identity()
+        values: dict[str, Any] = {
+            "phase": phase,
+            "backend_identity_hash": identity_hash,
+            "database": database,
+            "namespace": self.namespace,
+            "state_key": self.key,
+            "state_key_exists": False,
+            "ttl": -2,
+            "drafts": 0,
+            "views": 0,
+            "actions": 0,
+        }
+        try:
+            redis = await self._client()
+            raw = await redis.get(self.key)
+            values["state_key_exists"] = bool(raw)
+            values["ttl"] = await redis.ttl(self.key)
+            if raw:
+                document = json.loads(raw)
+                _validate_document(document)
+                state = document["state"]
+                values["drafts"] = len(state.get("drafts", {}))
+                values["views"] = len(state.get("views", {}))
+                values["actions"] = len(state.get("actions", {}))
+        except Exception as exc:
+            values["error"] = type(exc).__name__
+        logger.warning(
+            "AGENT_STATE_STARTUP phase=%s namespace=%s backend_identity_hash=%s database=%s state_key=%s state_key_exists_%s=%s ttl_%s=%s drafts_%s=%s views_%s=%s actions_%s=%s error=%s process_id=%s instance_id=%s",
+            values["phase"], values["namespace"], values["backend_identity_hash"], values["database"],
+            values["state_key"], values["phase"], values["state_key_exists"], values["phase"], values["ttl"],
+            values["phase"], values["drafts"], values["phase"], values["views"], values["phase"], values["actions"],
+            values.get("error", "none"), os.getpid(),
+            os.getenv("RENDER_INSTANCE_ID", "unknown"),
+        )
+        return values
 
     async def _acquire(self, redis: Any) -> str:
         token = uuid4().hex
@@ -380,9 +442,11 @@ class SharedAgentStateStore(AgentStateStore):
                 raise AgentStateBackendUnavailable(f"shared state key has invalid TTL {redis_ttl}")
             for action_id in getattr(store, "pending_agent_action_ids", set()):
                 logger.info(
-                    "ACTION_PERSISTED action_id=%s redis_key=%s record_path=%s/%s redis_ttl=%s persisted=true namespace=%s process_id=%s instance_id=%s store_id=%s",
+                    "ACTION_PERSISTED action_id=%s redis_key=%s state_key=%s record_path=%s/%s redis_ttl=%s persisted=true namespace=%s backend_identity_hash=%s redis_db=%s process=%s render_instance=%s process_id=%s instance_id=%s store_id=%s",
                     action_id, key_for_action(self.namespace, action_id).redis_key,
+                    key_for_action(self.namespace, action_id).redis_key,
                     *key_for_action(self.namespace, action_id).record_path, redis_ttl, self.namespace,
+                    self._backend_identity()[0], self._backend_identity()[1], os.getpid(), os.getenv("RENDER_INSTANCE_ID", "unknown"),
                     os.getpid(), os.getenv("RENDER_INSTANCE_ID", "unknown"),
                     getattr(store, "server_instance_id", "unknown"),
                 )

@@ -30,7 +30,9 @@ except ImportError:  # Render runs `uvicorn app:app` from web/
 @asynccontextmanager
 async def app_lifespan(_app):
     if agent_state_backend.shared:
+        await agent_state_backend.startup_diagnostics("before")
         await agent_state_backend.roundtrip()
+        await agent_state_backend.startup_diagnostics("after")
     yield
 
 

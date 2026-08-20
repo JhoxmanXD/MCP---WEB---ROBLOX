@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import json
 import re
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +13,93 @@ from web.store import MemoryStore
 
 
 client = TestClient(app)
+
+
+class _ForensicRedis:
+    """Small async Redis double for production backend lifecycle tests."""
+
+    def __init__(self):
+        self.values = {}
+        self.expiries = {}
+        self.operations = []
+
+    def _expired(self, key):
+        expiry = self.expiries.get(key)
+        if expiry is not None and expiry <= time.monotonic():
+            self.values.pop(key, None)
+            self.expiries.pop(key, None)
+            return True
+        return False
+
+    async def ping(self):
+        return True
+
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.values and not self._expired(key):
+            return False
+        self.values[key] = value
+        if ex is not None:
+            self.expiries[key] = time.monotonic() + ex
+        else:
+            self.expiries.pop(key, None)
+        self.operations.append(("set", key))
+        return True
+
+    async def get(self, key):
+        if self._expired(key):
+            return None
+        return self.values.get(key)
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+        self.expiries.pop(key, None)
+        self.operations.append(("delete", key))
+        return 1
+
+    async def ttl(self, key):
+        if self._expired(key):
+            return -2
+        expiry = self.expiries.get(key)
+        return max(1, int(expiry - time.monotonic())) if expiry is not None else -1
+
+    async def eval(self, _script, _key_count, key, token):
+        if await self.get(key) == token:
+            await self.delete(key)
+        return 1
+
+    def pipeline(self, transaction=True):
+        assert transaction is True
+        return _ForensicPipeline(self)
+
+
+class _ForensicPipeline:
+    def __init__(self, redis):
+        self.redis = redis
+        self.commands = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def watch(self, _key):
+        return None
+
+    async def get(self, key):
+        return await self.redis.get(key)
+
+    def multi(self):
+        return None
+
+    def set(self, key, value, ex=None):
+        self.commands.append((key, value, ex))
+
+    async def execute(self):
+        for key, value, ex in self.commands:
+            await self.redis.set(key, value, ex=ex)
+        self.commands.clear()
+        return True
 
 
 def setup_function():
@@ -61,6 +151,142 @@ def test_shared_agent_state_survives_restart_and_alternating_clients():
         async with backend.request(restarted_worker):
             assert len(restarted_worker.actions) == 83
             assert restarted_worker.actions["A_81"]["action_id"] == "A_81"
+
+    asyncio.run(scenario())
+
+
+def test_redis_startup_roundtrip_isolated_from_production_state_key():
+    namespace = "forensic:startup"
+    backend = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+    redis = _ForensicRedis()
+    backend._redis = redis
+    production_key = f"{namespace}:state"
+    redis.values[production_key] = '{"sentinel":"must-survive"}'
+    redis.expiries[production_key] = time.monotonic() + 3600
+    before = redis.values[production_key]
+
+    async def actual():
+        assert await backend.roundtrip() is True
+
+    asyncio.run(actual())
+
+    assert redis.values[production_key] == before
+    assert all(key != production_key for _operation, key in redis.operations)
+    diagnostic_keys = {key for _operation, key in redis.operations}
+    assert len(diagnostic_keys) == 1
+    assert next(iter(diagnostic_keys)).startswith(f"{namespace}:diagnostic:")
+    assert next(iter(diagnostic_keys)) not in redis.values
+
+
+def test_redis_store_constructor_is_read_only():
+    namespace = "forensic:constructor"
+    redis = _ForensicRedis()
+    redis.values[f"{namespace}:state"] = "preexisting"
+    backend = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+
+    assert backend._redis is None
+    assert redis.operations == []
+    assert redis.values[f"{namespace}:state"] == "preexisting"
+
+
+def test_backend_identity_hash_is_stable_without_exposing_redis_secret():
+    first = RedisAgentStateBackend("redis://:super-secret@redis.example:6379/4", "forensic:identity", 3600, 60)
+    second = RedisAgentStateBackend("redis://:super-secret@redis.example:6379/4", "forensic:identity", 3600, 60)
+
+    assert first._backend_identity() == second._backend_identity()
+    identity_hash, database = first._backend_identity()
+    assert len(identity_hash) == 16
+    assert database == "4"
+    assert "super-secret" not in identity_hash
+    status = first.status()
+    assert status["backend_identity_hash"] == identity_hash
+    assert status["redis_db"] == "4"
+    assert status["state_key"] == "forensic:identity:state"
+
+
+def test_redis_restart_survival_runs_startup_hook_then_follows_action():
+    namespace = "forensic:restart"
+    redis = _ForensicRedis()
+    backend_a = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+    backend_b = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+    backend_a._redis = redis
+    backend_b._redis = redis
+    worker_a = MemoryStore()
+
+    async def scenario():
+        async with backend_a.request(worker_a):
+            worker_a.drafts["d_restart"] = {"draft_id": "d_restart", "revision": 0}
+            worker_a.views["V_restart"] = {"view_id": "V_restart", "draft_id": "d_restart", "revision": 0}
+            worker_a.actions["A_restart"] = {
+                "action_id": "A_restart", "draft_id": "d_restart", "view_id": "V_restart",
+                "expected_revision": 0, "operation": "set_arg", "payload": {},
+                "consumed": False, "created_at": "now", "expires_at": "2099-01-01T00:00:00+00:00",
+                "state_schema_version": "agent-state-v1",
+            }
+
+        state_key = backend_a.key
+        state_before = redis.values[state_key]
+        hash_before = hashlib.sha256(state_before.encode()).hexdigest()
+        ttl_before = await redis.ttl(state_key)
+
+        # This is the production lifespan hook. It must not touch :state.
+        startup_before = await backend_b.startup_diagnostics("before")
+        assert await backend_b.roundtrip() is True
+        startup_after = await backend_b.startup_diagnostics("after")
+        assert startup_before["state_key_exists"] is True
+        assert startup_before["drafts"] == startup_after["drafts"] == 1
+        assert startup_before["views"] == startup_after["views"] == 1
+        assert startup_before["actions"] == startup_after["actions"] == 1
+        assert startup_before["ttl"] > 0 and startup_after["ttl"] > 0
+        worker_b = MemoryStore()
+        revision_before_mutation = await backend_b._load(redis, worker_b)
+        assert revision_before_mutation == 1
+        assert state_key in redis.values
+        assert await redis.ttl(state_key) > 0
+        assert "d_restart" in worker_b.drafts
+        assert "V_restart" in worker_b.views
+        assert "A_restart" in worker_b.actions
+        assert hashlib.sha256(redis.values[state_key].encode()).hexdigest() == hash_before
+
+        async with backend_b.request(worker_b):
+            worker_b.actions["A_restart"]["consumed"] = True
+
+        worker_c = MemoryStore()
+        await backend_b._load(redis, worker_c)
+        assert worker_c.actions["A_restart"]["consumed"] is True
+        assert ttl_before > 0
+
+    asyncio.run(scenario())
+
+
+def test_redis_lock_and_cas_preserve_updates_from_two_clients():
+    namespace = "forensic:cas"
+    redis = _ForensicRedis()
+    seed_backend = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+    backend_a = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+    backend_b = RedisAgentStateBackend("redis://forensic", namespace, 3600, 60)
+    for backend in (seed_backend, backend_a, backend_b):
+        backend._redis = redis
+    seed = MemoryStore()
+
+    async def scenario():
+        async with seed_backend.request(seed):
+            seed.drafts["d_cas"] = {"draft_id": "d_cas", "revision": 0}
+            seed.actions["A_cas"] = {
+                "action_id": "A_cas", "draft_id": "d_cas", "consumed": False,
+                "created_at": "now", "expires_at": "2099-01-01T00:00:00+00:00",
+                "state_schema_version": "agent-state-v1",
+            }
+
+        async def update(backend, marker):
+            worker = MemoryStore()
+            async with backend.request(worker):
+                worker.actions["A_cas"].setdefault("markers", {})[marker] = True
+
+        await asyncio.gather(update(backend_a, "client_a"), update(backend_b, "client_b"))
+        final = MemoryStore()
+        await seed_backend._load(redis, final)
+        assert final.actions["A_cas"]["markers"] == {"client_a": True, "client_b": True}
 
     asyncio.run(scenario())
 
