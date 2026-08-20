@@ -324,6 +324,44 @@ def _compose_via_visible_links(draft_page, value: str, argument: str = "name"):
     return finished
 
 
+def test_exact_public_revision_trace_open_composer_is_not_a_mutation(caplog):
+    caplog.set_level("INFO", logger="mcp-web.agent")
+    store.catalog.tools = [{
+        "name": "find",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["query", "limit"],
+        },
+    }]
+    store.catalog.tool_count = 1
+    tool_page = client.get("/agent/tool/find")
+    start = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(start.headers["location"])
+    view = client.get(_link(view.text, "Set Workspace"), follow_redirects=True)
+    draft_id = re.search(r"DRAFT_ID: <code>(d_[^<]+)", view.text).group(1)
+    assert store.drafts[draft_id]["revision"] == 1
+    view = client.get(_link(view.text, "10"), follow_redirects=True)
+    assert store.drafts[draft_id]["revision"] == 2
+    assert "Set Workspace" not in view.text
+    view_id = re.search(r"VIEW_ID: <code>(V_[^<]+)", view.text).group(1)
+    store.actions["A_noop"] = {
+        "action_id": "A_noop", "draft_id": draft_id, "view_id": view_id,
+        "expected_revision": 2, "operation": "set_arg",
+        "payload": {"name": "query", "value": "Workspace"}, "consumed": False,
+        "resulting_url": None, "created_at": "now", "expires_at": store.drafts[draft_id]["expires_at"],
+        "state_schema_version": "agent-state-v1",
+    }
+    client.get("/agent/action/A_noop", follow_redirects=False)
+    assert store.drafts[draft_id]["revision"] == 2
+    assert "DRAFT_REVISION_UNCHANGED" in caplog.text
+    composer = client.get(_link(view.text, "Open String Composer (query)"), follow_redirects=True)
+    assert store.drafts[draft_id]["revision"] == 2
+    composer = client.get(_link(composer.text, "Append A"), follow_redirects=True)
+    assert store.drafts[draft_id]["revision"] == 3
+    assert store.drafts[draft_id]["arguments"] == {"query": "WorkspaceA", "limit": 10}
+
+
 def test_string_composer_builds_case_sensitive_values_using_only_generated_links():
     first = _compose_via_visible_links(_start_string_draft(), "SOL_MCP_FINAL_TEST")
     assert "Open String Composer" in first.text

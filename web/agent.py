@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 try:
@@ -154,6 +154,18 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             "instance_id": str(RENDER_INSTANCE_ID),
         }
 
+    def request_context(request: Request) -> dict[str, str]:
+        def header(name: str) -> str:
+            value = request.headers.get(name, "")
+            return value[:160].replace("\r", " ").replace("\n", " ") or "none"
+        return {
+            "method": request.method,
+            "path": request.url.path[:200],
+            "request_id": header("x-request-id"),
+            "user_agent": header("user-agent"),
+            "referer": header("referer"),
+        }
+
     def register_action(action: dict[str, Any]) -> None:
         draft = store.drafts.get(action.get("draft_id"))
         if draft and not action.get("expires_at"):
@@ -261,9 +273,41 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
     def missing(draft: dict[str, Any]) -> list[str]:
         return [name for name in required(draft["schema"]) if name not in draft["arguments"]]
 
-    def bump(draft: dict[str, Any]) -> None:
-        draft["revision"] = int(draft.get("revision", 0)) + 1
+    def arguments_hash(draft: dict[str, Any]) -> str:
+        canonical = json.dumps(
+            {"tool_name": draft["tool_name"], "arguments": draft.get("arguments", {})},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def advance_revision(
+        draft: dict[str, Any],
+        reason: str,
+        action: dict[str, Any] | None = None,
+        before_hash: str | None = None,
+    ) -> bool:
+        revision_before = int(draft.get("revision", 0))
+        before_hash = before_hash or arguments_hash(draft)
+        after_hash = arguments_hash(draft)
+        action_id = action.get("action_id") if action else None
+        operation = action.get("operation") if action else reason
+        context = lifecycle_context()
+        if before_hash == after_hash:
+            refresh_deadline(draft)
+            logger.info(
+                "DRAFT_REVISION_UNCHANGED draft_id=%s revision=%s reason=%s action_id=%s operation=%s arguments_hash=%s process=%s instance=%s",
+                draft["draft_id"], revision_before, reason, action_id, operation,
+                after_hash, context["process_id"], context["instance_id"],
+            )
+            return False
+        draft["revision"] = revision_before + 1
         refresh_deadline(draft)
+        logger.info(
+            "DRAFT_REVISION_ADVANCED draft_id=%s revision_before=%s revision_after=%s reason=%s action_id=%s operation=%s arguments_hash_before=%s arguments_hash_after=%s process=%s instance=%s",
+            draft["draft_id"], revision_before, draft["revision"], reason, action_id, operation,
+            before_hash, after_hash, context["process_id"], context["instance_id"],
+        )
+        return True
 
     def create_agent_view(draft: dict[str, Any]) -> str:
         view_id = "V_" + uuid4().hex[:18]
@@ -507,18 +551,19 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
     def snapshot_links(view: dict[str, Any], name: str, schema: dict[str, Any]) -> str:
         links: list[str] = []
         base = {"name": name}
+        current = view.get("arguments_snapshot", {}).get(name, object())
         if "enum" in schema:
-            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in schema["enum"]]
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in schema["enum"] if value != current]
         typ = schema_type(schema)
         if typ == "string":
             values = [schema.get("default"), "Workspace", "Part", "Folder", "Model", "Script", "Name", "Parent"] + list(reversed(view.get("recent_string_values", [])))
-            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in values if value is not None]
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {value}") for value in values if value is not None and value != current]
             links.append(view_action_link(view, "open_string", {"name": name, "view_id": view["view_id"]}, f"Open String Composer ({name})"))
         elif typ == "boolean":
-            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {str(value).lower()}") for value in (True, False)]
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, f"Set {str(value).lower()}") for value in (True, False) if value != current]
         elif typ in {"integer", "number"}:
             values = [0, 1, -1, 10, 100, 0.5] if typ == "number" else [0, 1, -1, 10, 100]
-            links += [view_action_link(view, "set_arg", {**base, "value": value}, str(value)) for value in values]
+            links += [view_action_link(view, "set_arg", {**base, "value": value}, str(value)) for value in values if value != current]
         elif typ == "object":
             links.append(view_action_link(view, "open_editor", {"view_id": view["view_id"], "path": [name], "kind": "object", "schema": schema}, "Edit object"))
             if name in {"values", "properties", "attributes"}:
@@ -530,8 +575,10 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         if selector_schema(name, schema):
             links.append(view_action_link(view, "open_picker", {"name": name, "view_id": view["view_id"]}, "Choose Roblox Instance"))
         if nullable(schema):
-            links.append(view_action_link(view, "set_arg", {**base, "value": None}, "Set null"))
-        links.append(view_action_link(view, "clear", base, "Clear"))
+            if current is not None:
+                links.append(view_action_link(view, "set_arg", {**base, "value": None}, "Set null"))
+        if name in view.get("arguments_snapshot", {}):
+            links.append(view_action_link(view, "clear", base, "Clear"))
         return " ".join(links)
 
     def remember_string(value: str) -> None:
@@ -820,14 +867,15 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         return agent_page("Invocation View", body)
 
     @app.get("/agent/action/{action_id}", response_class=HTMLResponse)
-    async def agent_action(action_id: str):
+    async def agent_action(action_id: str, request: Request):
         purge_drafts()
+        request_info = request_context(request)
         action = store.actions.get(action_id)
         if not action:
             return missing_action(action_id)
         context = lifecycle_context()
         logger.info(
-            "ACTION_LOOKUP action_id=%s exists=yes reason=FOUND redis_key=%s redis_ttl=%s namespace=%s store_id=%s process_id=%s instance_id=%s action_count=%s draft_id=%s view_id=%s draft_exists=%s view_exists=%s expected_revision=%s consumed=%s deserialize_status=ok",
+            "ACTION_LOOKUP action_id=%s exists=yes reason=FOUND redis_key=%s redis_ttl=%s namespace=%s store_id=%s process_id=%s instance_id=%s action_count=%s draft_id=%s view_id=%s draft_exists=%s view_exists=%s expected_revision=%s consumed=%s deserialize_status=ok method=%s request_id=%s user_agent=%s referer=%s",
             action_id,
             (agent_state_status() if agent_state_status else {}).get("state_key", "unknown"),
             getattr(store, "agent_state_observed_ttl", "unknown"),
@@ -836,9 +884,11 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             len(store.actions), action.get("draft_id"), action.get("view_id"),
             action.get("draft_id") in store.drafts, action.get("view_id") in store.views,
             action.get("expected_revision"), action.get("consumed"),
+            request_info["method"], request_info["request_id"], request_info["user_agent"], request_info["referer"],
         )
         if action.get("consumed"):
             target = action.get("resulting_url")
+            logger.info("ACTION_REPLAY action_id=%s operation=%s resulting_url=%s method=%s request_id=%s user_agent=%s referer=%s", action_id, action.get("operation"), target or "none", request_info["method"], request_info["request_id"], request_info["user_agent"], request_info["referer"])
             return agent_redirect(target) if target else agent_page("Action complete", "<h1>Action already consumed</h1>")
         try:
             draft = draft_or_404(action["draft_id"])
@@ -848,6 +898,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             raise
         if action["operation"] not in {"execute_prepared", "refresh_result"} and int(action["expected_revision"]) != int(draft.get("revision", 0)):
             return stale_page(action, draft)
+        arguments_hash_before = arguments_hash(draft)
         operation = action["operation"]; payload = action["payload"]
         if operation == "open_string":
             view_id = payload.get("view_id") or create_agent_view(draft)
@@ -896,13 +947,11 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 target = create_editor(store.views[editor["view_id"]], editor["path"], "object", editor.get("parent_schema"), editor.get("property_schemas"))
             else:
                 path_set(draft["arguments"], editor["path"] + [key], None)
-                bump(draft)
-                next_view = create_agent_view(draft)
                 property_schemas = await resolve_property_schemas(draft, editor["path"], [key])
                 if key in property_schemas:
                     path_set(draft["arguments"], editor["path"] + [key], default_for_schema(property_schemas[key]))
-                    bump(draft)
-                    next_view = create_agent_view(draft)
+                advance_revision(draft, operation, action, arguments_hash_before)
+                next_view = create_agent_view(draft)
                 target = create_editor(store.views[next_view], editor["path"], "object", editor.get("parent_schema") or {"type": "object", "additionalProperties": True}, {**editor.get("property_schemas", {}), **property_schemas})
         elif operation == "editor_initialize_value":
             editor = store.editors.get(payload.get("editor_id"))
@@ -913,7 +962,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 raise HTTPException(400, "Unsupported value type")
             defaults = {"string": "", "number": 0, "integer": 0, "boolean": False, "object": {}, "array": []}
             path_set(draft["arguments"], editor["path"], defaults[value_type])
-            bump(draft)
+            advance_revision(draft, operation, action, arguments_hash_before)
             next_view = create_agent_view(draft)
             target = create_editor(store.views[next_view], editor["path"], value_type, {"type": value_type, "items": {"type": "object"}} if value_type == "array" else {"type": value_type, "additionalProperties": True} if value_type == "object" else {"type": value_type})
         elif operation.startswith("editor_"):
@@ -971,7 +1020,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 mutated = False
             if not mutated:
                 raise HTTPException(400, "Unknown editor action")
-            bump(draft)
+            advance_revision(draft, operation, action, arguments_hash_before)
             next_view = create_agent_view(draft)
             if operation in {"editor_append_string", "editor_append_number", "editor_backspace", "editor_clear_scalar"}:
                 target = create_editor(store.views[next_view], path, editor["kind"], editor["schema"])
@@ -1031,13 +1080,21 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 remember_string(str(draft["arguments"].get(payload["name"], "")))
             else:
                 raise HTTPException(400, "Unknown action")
-            bump(draft)
+            advance_revision(draft, operation, action, arguments_hash_before)
             next_view = create_agent_view(draft)
             if operation in {"append_string", "backspace", "clear"} and schema_type(draft["schema"].get("properties", {}).get(payload.get("name"), {})) == "string":
                 target = f"/agent/string-view/{next_view}/{quote(payload['name'], safe='')}"
             else:
                 target = f"/agent/view/{next_view}"
+        revision_after = int(draft.get("revision", 0))
         action["consumed"] = True; action["resulting_url"] = target
+        logger.info(
+            "ACTION_CONSUMED action_id=%s operation=%s expected_revision=%s revision_before=%s revision_after=%s arguments_hash_before=%s arguments_hash_after=%s method=%s request_id=%s user_agent=%s referer=%s resulting_url=%s",
+            action_id, operation, action.get("expected_revision"),
+            int(action.get("expected_revision", revision_after)), revision_after,
+            arguments_hash_before, arguments_hash(draft), request_info["method"],
+            request_info["request_id"], request_info["user_agent"], request_info["referer"], target,
+        )
         return agent_redirect(target)
 
     @app.get("/agent/string-view/{view_id}/{name}", response_class=HTMLResponse)
