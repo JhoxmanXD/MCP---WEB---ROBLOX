@@ -873,6 +873,132 @@ def test_typed_property_dispatch_exposes_vector3_color3_and_enum_editors():
     assert "Enum Editor" in enum_page.text and "Set Grass" in enum_page.text and "Set Rock" in enum_page.text
 
 
+def test_runtime_enum_metadata_waits_for_delayed_job_and_reaches_editor(monkeypatch):
+    from web import agent as agent_module
+
+    runtime_metadata = {
+        "Material": {
+            "readable": True,
+            "propertyName": "Material",
+            "robloxType": "EnumItem",
+            "enumType": "Material",
+            "value": {"value": 256, "enumType": "Material", "name": "Plastic", "$type": "EnumItem"},
+            "enumValues": [
+                {"value": 256, "enumType": "Material", "name": "Plastic", "$type": "EnumItem"},
+                {"value": 1280, "enumType": "Material", "name": "Grass", "$type": "EnumItem"},
+                {"value": 1360, "enumType": "Material", "name": "Ground", "$type": "EnumItem"},
+                {"value": 896, "enumType": "Material", "name": "Rock", "$type": "EnumItem"},
+            ],
+        }
+    }
+    runtime_result = {"structuredContent": {"ok": True, "data": {"className": "Part", "propertyMetadata": runtime_metadata}}}
+    original_create_job = store.create_job
+
+    def delayed_create_job(job):
+        created = original_create_job(job)
+        if job.tool == "studio_get_properties":
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.05, lambda: store.complete(job.request_id, True, runtime_result))
+        return created
+
+    monkeypatch.setattr(agent_module, "DISCOVERY_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(store, "create_job", delayed_create_job)
+    store.catalog.tools = [
+        {"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+            "class_name": {"type": "string"}, "properties": {"type": "object", "additionalProperties": True},
+        }}},
+        {"name": "studio_get_properties", "inputSchema": {"type": "object", "properties": {"class_name": {"type": "string"}}}},
+    ]
+    store.catalog.tool_count = 2
+
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    view = client.get(_links(view.text, "Set Part")[0], follow_redirects=True)
+    editor = client.get(_links(view.text, "Edit object")[0], follow_redirects=True)
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Material":
+        key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    enum_page = client.get(_link(editor.text, "Edit Material"))
+
+    assert "ROBLOX_TYPE:" in enum_page.text and "EnumItem" in enum_page.text
+    assert "ENUM_TYPE:" in enum_page.text and "Material" in enum_page.text
+    assert "Set Plastic" in enum_page.text
+    assert "Set Grass" in enum_page.text
+    assert "Set Ground" in enum_page.text
+    assert "Set Rock" in enum_page.text
+    draft_view = client.get(_link(editor.text, "Back to Draft"))
+    draft_id = re.search(r"DRAFT_ID: <code>(d_[^<]+)", draft_view.text).group(1)
+    assert store.drafts[draft_id]["property_metadata"]["Material"]["enumValues"] == runtime_metadata["Material"]["enumValues"]
+
+
+def test_incomplete_enum_metadata_does_not_overwrite_complete_runtime_values():
+    from web.agent import merge_property_metadata
+
+    complete = {
+        "robloxType": "EnumItem",
+        "enumType": "Material",
+        "enumValues": [{"name": "Grass", "$type": "EnumItem"}],
+    }
+    incomplete = {"robloxType": "EnumItem", "enumType": "Material"}
+    merged = merge_property_metadata(complete, incomplete)
+    assert merged["enumValues"] == complete["enumValues"]
+
+
+def test_enum_metadata_recovers_after_first_discovery_timeout(monkeypatch):
+    from web import agent as agent_module
+
+    runtime_result = {"structuredContent": {"ok": True, "data": {"propertyMetadata": {
+        "Material": {
+            "robloxType": "EnumItem",
+            "enumType": "Material",
+            "enumValues": [
+                {"value": 1280, "enumType": "Material", "name": "Grass", "$type": "EnumItem"},
+                {"value": 1360, "enumType": "Material", "name": "Ground", "$type": "EnumItem"},
+            ],
+        }
+    }}}}
+    original_create_job = store.create_job
+    discovery_calls = 0
+
+    def recover_on_second_discovery(job):
+        nonlocal discovery_calls
+        created = original_create_job(job)
+        if job.tool == "studio_get_properties":
+            discovery_calls += 1
+            if discovery_calls == 2:
+                asyncio.get_running_loop().call_later(0.05, lambda: store.complete(job.request_id, True, runtime_result))
+        return created
+
+    monkeypatch.setattr(agent_module, "DISCOVERY_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(store, "create_job", recover_on_second_discovery)
+    store.catalog.tools = [
+        {"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+            "class_name": {"type": "string"}, "properties": {"type": "object", "additionalProperties": True},
+        }}},
+        {"name": "studio_get_properties", "inputSchema": {"type": "object", "properties": {"class_name": {"type": "string"}}}},
+    ]
+    store.catalog.tool_count = 2
+
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    view = client.get(_links(view.text, "Set Part")[0], follow_redirects=True)
+    editor = client.get(_links(view.text, "Edit object")[0], follow_redirects=True)
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Material":
+        key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    draft_view = client.get(_link(editor.text, "Back to Draft"))
+    draft_id = re.search(r"DRAFT_ID: <code>(d_[^<]+)", draft_view.text).group(1)
+    assert "Material" not in store.drafts[draft_id].get("property_metadata", {})
+
+    reopened = client.get(_links(draft_view.text, "Edit object")[0], follow_redirects=True)
+    enum_page = client.get(_link(reopened.text, "Edit Material"))
+    assert "Set Grass" in enum_page.text and "Set Ground" in enum_page.text
+
+
 def test_audited_basepart_types_and_spawnlocation_inheritance_work_without_live_metadata():
     store.catalog.tools = [{"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
         "class_name": {"type": "string"},

@@ -30,6 +30,12 @@ def now() -> str:
 
 logger = logging.getLogger("mcp-web.agent")
 
+# A Render Free instance can temporarily leave a discovery job queued while
+# the relay reconnects.  Keep the bounded wait long enough to cover that
+# recovery window; otherwise the editor freezes the incomplete fallback into
+# an immutable snapshot before the runtime metadata arrives.
+DISCOVERY_WAIT_SECONDS = 45.0
+
 
 def schema_type(schema: dict[str, Any]) -> str:
     if isinstance(schema.get("type"), str):
@@ -69,6 +75,34 @@ def typed_schema(value_type: str, metadata: dict[str, Any] | None = None) -> dic
     if metadata.get("enumType") or metadata.get("enum_type"):
         schema["enum_type"] = metadata.get("enumType") or metadata.get("enum_type")
     return schema
+
+
+def merge_property_metadata(existing: dict[str, Any] | None, incoming: dict[str, Any] | None) -> dict[str, Any]:
+    """Merge runtime metadata without losing a previously complete enum list."""
+    merged = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    if not isinstance(incoming, dict):
+        return merged
+    for key, value in incoming.items():
+        if key in {"enumValues", "enum_values"}:
+            if isinstance(value, list) and value:
+                merged[key] = copy.deepcopy(value)
+            elif key not in merged:
+                merged[key] = copy.deepcopy(value)
+            continue
+        if value is not None:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def enum_metadata_incomplete(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    roblox_value_type = metadata.get("robloxType") or metadata.get("roblox_type")
+    return roblox_value_type == "EnumItem" and not (
+        isinstance(metadata.get("enumValues"), list) and metadata.get("enumValues")
+    ) and not (
+        isinstance(metadata.get("enum_values"), list) and metadata.get("enum_values")
+    )
 
 
 # These are the property contracts confirmed from the Roblox bridge.  The
@@ -607,7 +641,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             return None
         request_id = "WEB_AGENT_DISCOVER_" + uuid4().hex[:12]
         store.create_job(Job(request_id=request_id, tool=tool_name, arguments=arguments))
-        deadline = asyncio.get_running_loop().time() + 8
+        deadline = asyncio.get_running_loop().time() + DISCOVERY_WAIT_SECONDS
         while asyncio.get_running_loop().time() < deadline:
             job = store.jobs[request_id]
             if job.status in {"completed", "error"}:
@@ -696,6 +730,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                     cache[name] = copy.deepcopy(hints[name])
             missing_names = [name for name in missing_names if name not in cache]
         context = property_context(draft, object_path)
+        live_discovery_attempted = False
         # Keep audited contracts aside until live metadata has had a chance to
         # enrich them (especially EnumItem values).
         known_fallbacks: dict[str, dict[str, Any]] = {}
@@ -710,16 +745,22 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 request["ref"] = context["ref"]
             else:
                 request["class_name"] = context["class_name"]
-            job = await discover(tool_name, request)
+            live_discovery_attempted = tool_name in catalog_tools()
+            job = await discover(tool_name, request) if live_discovery_attempted else None
             data = result_data(job.get("result")) if isinstance(job, dict) and job.get("status") == "completed" else None
             if isinstance(data, dict):
                 metadata = data.get("propertyMetadata") or data.get("property_metadata") or {}
                 values = data.get("properties") or {}
                 for name in missing_names:
                     if name in metadata:
-                        cache[name] = copy.deepcopy(metadata[name])
+                        merged = merge_property_metadata(cache.get(name), metadata[name])
+                        if enum_metadata_incomplete(merged):
+                            cache.pop(name, None)
+                        else:
+                            cache[name] = merged
                     elif name in values:
-                        cache[name] = {"value": copy.deepcopy(values[name])}
+                        cache[name] = merge_property_metadata(cache.get(name), {"value": values[name]})
+            missing_names = [name for name in missing_names if name not in cache or enum_metadata_incomplete(cache.get(name))]
             if missing_names and context.get("class_name") and tool_name == "studio_get_properties" and "studio_find_instances" in catalog_tools():
                 sample_requests = [
                     {"query": "", "class_name": context["class_name"], "limit": 1},
@@ -748,19 +789,27 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                         values = sample_data.get("properties") or {}
                         for name in missing_names:
                             if name in metadata:
-                                cache[name] = copy.deepcopy(metadata[name])
+                                merged = merge_property_metadata(cache.get(name), metadata[name])
+                                if enum_metadata_incomplete(merged):
+                                    cache.pop(name, None)
+                                else:
+                                    cache[name] = merged
                             elif name in values:
-                                cache[name] = {"value": copy.deepcopy(values[name])}
+                                cache[name] = merge_property_metadata(cache.get(name), {"value": values[name]})
                     if any(name in cache for name in missing_names):
                         break
         # Use only audited contracts as a deterministic offline fallback.  A
         # live bridge response above always wins and supplies enum members.
-        for name, known in known_fallbacks.items():
-            if name not in cache:
-                cache[name] = copy.deepcopy(known)
+        if not live_discovery_attempted:
+            for name, known in known_fallbacks.items():
+                if name not in cache:
+                    cache[name] = copy.deepcopy(known)
         result: dict[str, dict[str, Any]] = {}
         for name in names:
-            typed = property_schema_from_metadata(cache.get(name))
+            metadata = cache.get(name)
+            if metadata is None and not live_discovery_attempted:
+                metadata = known_fallbacks.get(name)
+            typed = property_schema_from_metadata(metadata)
             if typed:
                 result[name] = typed
         return result
