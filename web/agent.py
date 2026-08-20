@@ -554,7 +554,7 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             for key, item in value.items() if isinstance(value, dict) else []:
                 item_schema = editor.get("property_schemas", {}).get(str(key)) or properties.get(key) or (schema.get("additionalProperties") if isinstance(schema.get("additionalProperties"), dict) else None)
                 item_schema = item_schema or infer_schema(item)
-                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [key], "kind": roblox_type(item_schema) or schema_type(item_schema), "schema": item_schema, "parent_schema": schema}, f"Edit {key}")
+                edit = editor_action_link(editor, "open_editor", {"view_id": editor["view_id"], "path": editor["path"] + [key], "kind": roblox_type(item_schema) or schema_type(item_schema), "schema": item_schema, "parent_schema": schema, "property_schemas": editor.get("property_schemas", {})}, f"Edit {key}")
                 remove = editor_action_link(editor, "editor_remove_key", {"key": key}, f"Remove {key}")
                 items.append(f"<li><strong>{escape(str(key))}</strong>: <code>{escape(str(item))}</code> {edit} {remove}</li>")
             add = editor_action_link(editor, "editor_open_key", {"parent_schema": schema}, "Add field")
@@ -1020,7 +1020,17 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             except (KeyError, IndexError, TypeError):
                 source_value = default_for_schema(editor_schema or {})
             if isinstance(source_value, dict) and isinstance(editor_schema, dict) and schema_type(editor_schema) == "object":
-                property_schemas = await resolve_property_schemas(draft, editor_path, [str(key) for key in source_value])
+                property_schemas = copy.deepcopy(payload.get("property_schemas") or {})
+                unresolved_names = []
+                for key in source_value:
+                    property_schema = property_schemas.get(str(key))
+                    if not isinstance(property_schema, dict):
+                        unresolved_names.append(str(key))
+                        continue
+                    if roblox_type(property_schema) == "EnumItem" and not (property_schema.get("enum_values") or property_schema.get("enumValues")):
+                        unresolved_names.append(str(key))
+                if unresolved_names:
+                    property_schemas.update(await resolve_property_schemas(draft, editor_path, unresolved_names))
             target = create_editor(source_view, editor_path, payload.get("kind", roblox_type(editor_schema or {}) or "value"), editor_schema, property_schemas, payload.get("parent_schema"))
         elif operation == "editor_open_key":
             editor = store.editors.get(payload.get("editor_id"))
