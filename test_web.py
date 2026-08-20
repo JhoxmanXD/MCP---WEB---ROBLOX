@@ -957,6 +957,35 @@ def test_typed_property_dispatch_exposes_vector3_color3_and_enum_editors():
     assert "Enum Editor" in enum_page.text and "Set Grass" in enum_page.text and "Set Rock" in enum_page.text
 
 
+def test_known_typed_properties_do_not_discover_internal_vector_components(monkeypatch):
+    store.catalog.tools = [
+        {"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+            "class_name": {"type": "string"}, "properties": {"type": "object", "additionalProperties": True},
+        }}},
+        {"name": "studio_get_properties", "inputSchema": {"type": "object", "properties": {"class_name": {"type": "string"}}}},
+    ]
+    store.catalog.tool_count = 2
+    original_create_job = store.create_job
+
+    def reject_unneeded_discovery(job):
+        if job.tool == "studio_get_properties":
+            raise AssertionError("known Vector3 property must not discover its x/y/z components")
+        return original_create_job(job)
+
+    monkeypatch.setattr(store, "create_job", reject_unneeded_discovery)
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    view = client.get(_links(view.text, "Set Part")[0], follow_redirects=True)
+    editor = client.get(_links(view.text, "Edit object")[0])
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Size":
+        key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    typed = client.get(_link(editor.text, "Edit Size"))
+    assert "Vector3 Editor" in typed.text
+
+
 def test_runtime_enum_metadata_waits_for_delayed_job_and_reaches_editor(monkeypatch):
     from web import agent as agent_module
 

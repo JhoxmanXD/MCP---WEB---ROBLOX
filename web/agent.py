@@ -822,7 +822,11 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 missing_names = [name for name in missing_names if name not in cache or enum_metadata_incomplete(cache.get(name))]
                 if not missing_names:
                     break
-        if missing_names and (context.get("ref") is not None or context.get("class_name")):
+        live_metadata_needed = any(
+            name not in known_fallbacks or enum_metadata_incomplete(known_fallbacks.get(name))
+            for name in missing_names
+        )
+        if missing_names and live_metadata_needed and (context.get("ref") is not None or context.get("class_name")):
             tool_name = "studio_get_properties" if "studio_get_properties" in catalog_tools() else "properties"
             request: dict[str, Any] = {"names": missing_names}
             if context.get("ref") is not None:
@@ -1077,7 +1081,10 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                 source_value = path_get(source_view["arguments_snapshot"], editor_path) if editor_path else source_view["arguments_snapshot"]
             except (KeyError, IndexError, TypeError):
                 source_value = default_for_schema(editor_schema or {})
-            if isinstance(source_value, dict) and isinstance(editor_schema, dict) and schema_type(editor_schema) == "object":
+            typed_container = isinstance(editor_schema, dict) and roblox_type(editor_schema) in {
+                "Vector2", "Vector3", "Color3", "CFrame", "UDim", "UDim2", "NumberRange", "BrickColor",
+            }
+            if isinstance(source_value, dict) and isinstance(editor_schema, dict) and schema_type(editor_schema) == "object" and not typed_container:
                 property_schemas = copy.deepcopy(payload.get("property_schemas") or {})
                 unresolved_names = []
                 for key in source_value:
