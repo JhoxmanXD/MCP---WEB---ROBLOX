@@ -32,6 +32,10 @@ def restore_catalog_if_needed(relay: RelayWebClient, tools: list[dict], heartbea
         return False
 
 
+def catalog_refresh_needed(published: bool, previous_studio_connected: bool | None, studio_connected: bool) -> bool:
+    return not published or previous_studio_connected != studio_connected
+
+
 async def run() -> None:
     config = load_config()
     relay = RelayWebClient(config["relay_url"])
@@ -43,6 +47,8 @@ async def run() -> None:
     adapter = None
     tools: list[dict] = []
     studio_connected = False
+    catalog_published = False
+    catalog_studio_connected: bool | None = None
     last_studio_check = 0.0
     try:
         while True:
@@ -52,6 +58,8 @@ async def run() -> None:
                     adapter = await connect_with_backoff(mcp_url)
                     tools = await adapter.list_tools()
                     log.info("[MCP] Connected — %d tools discovered", len(tools))
+                    catalog_published = False
+                    catalog_studio_connected = None
                     last_studio_check = 0.0
                 now = time.monotonic()
                 if now - last_studio_check >= studio_check_interval:
@@ -65,7 +73,20 @@ async def run() -> None:
                     log.info("[STUDIO] %s", "connected" if studio_connected else "disconnected")
                     last_studio_check = now
                 heartbeat = relay.heartbeat({"client": client_name, "mcp_connected": True, "studio_connected": studio_connected, "tool_count": len(tools), "timestamp": iso_now()})
-                if await asyncio.to_thread(restore_catalog_if_needed, relay, tools, heartbeat):
+                refreshed = False
+                if catalog_refresh_needed(catalog_published, catalog_studio_connected, studio_connected):
+                    try:
+                        relay.catalog(tools, studio_connected)
+                        catalog_published = True
+                        catalog_studio_connected = studio_connected
+                        refreshed = True
+                    except Exception as exc:
+                        log.warning("[WEB] Catalog upload failed; retrying: %s", exc)
+                elif await asyncio.to_thread(restore_catalog_if_needed, relay, tools, heartbeat):
+                    catalog_published = True
+                    catalog_studio_connected = studio_connected
+                    refreshed = True
+                if refreshed:
                     log.info("[WEB] Catalog uploaded/restored (%d tools)", len(tools))
                 job = await asyncio.to_thread(relay.next_job)
                 if job:
