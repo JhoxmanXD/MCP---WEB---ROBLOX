@@ -37,3 +37,11 @@ La matriz es deliberadamente honesta: listar y describir una tool es dinámico p
 El bridge/plugin es la fuente de verdad de los tipos Roblox. `studio_get_properties` devuelve valores `$type` y `propertyMetadata`; con `class_name` puede describir defaults de una clase sin parentar una instancia. MCP-WEB conserva únicamente un fallback auditado y pequeño para propiedades `BasePart` confirmadas, aplicándolo también a `SpawnLocation` y descendientes conocidos; no mantiene un catálogo general de subclases ni adivina propiedades.
 
 Las formas canónicas confirmadas son `$type: Vector3` con `x/y/z`, `$type: Color3` con `r/g/b` normalizados, `$type: CFrame` con `components`, y `$type: EnumItem` con `enumType/name`. Tipos sin decoder de escritura no reciben un editor falso y caen en fallback seguro.
+
+## Agent lifecycle y diagnóstico
+
+Las acciones inmutables registran ownership hacia `draft_id` y `view_id`/editor/Prepared/Result. El deadline es rodante, 3600 segundos por draft, y todas las entidades descendientes se limpian juntas. Por eso la lifetime de una Action no es menor que la de la View que la publicó.
+
+Los eventos `ACTION_CREATED`, `ACTION_LOOKUP` y `AGENT_STATE_EXPIRED` incluyen IDs opacos, revisión, store id, process id e instance id, sin argumentos sensibles. Un estado ausente se comunica como `410 AGENT STATE EXPIRED`, no como un 404 genérico.
+
+El despliegue documentado es un único proceso uvicorn con `MemoryStore`. Soporta el lifecycle dentro del mismo proceso; multi-worker o multi-instance requiere backend compartido y operaciones atómicas antes de considerarse soportado.

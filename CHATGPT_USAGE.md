@@ -50,3 +50,11 @@ Cuando el bridge publica metadata de la propiedad, el gateway muestra un editor 
 - `CFrame`, `Vector2`, `UDim`, `UDim2`, `NumberRange` y `BrickColor`: editor typed cuando el bridge confirma el tipo y su representación escribible.
 
 La resolución usa el valor actual para `studio_set_properties` y metadata por `class_name` para `studio_create_instance`; para mantener usable el gateway mientras un plugin antiguo se reinicia, solo existe un fallback auditado para `BasePart` (`Size`, `Position`, `Color`, `Material`, `Anchored`, `CanCollide`) y sus descendientes conocidos (`Part`, `SpawnLocation`, `MeshPart`, etc.). No se adivinan otras propiedades. Si no hay metadata ni contrato auditado, aparece explícitamente el editor genérico de fallback. `create_instance.properties`, `set_properties.values` y operaciones typed dentro de `batch` usan el mismo dispatch.
+
+## Lifecycle de Agent
+
+Cada enlace `/agent/action/A_...` visible en una View viva queda registrado con ownership explícito hacia su draft y View. El TTL es rodante de 3600 segundos por draft; View, Action, editor, Prepared y Result comparten ese deadline y se limpian juntos.
+
+Si un enlace pertenece a estado expirado, la respuesta correcta es `410 AGENT STATE EXPIRED`; vuelve a `/agent/tools` y comienza una invocación nueva. No reutilices una View anterior después de una mutación.
+
+El estado de producción sigue siendo memoria por proceso. El Render start command documentado usa un único proceso uvicorn sin workers múltiples. No se debe activar `gunicorn`, `--workers > 1` o escalado horizontal sin añadir primero un backend compartido con consume atómico y compare-and-set de revisiones.

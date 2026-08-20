@@ -201,6 +201,60 @@ def test_string_composer_charset_and_edit_actions_are_navigable():
     assert "Workspace" in finished.text and "Recent" not in finished.text
 
 
+def test_live_view_actions_are_registered_owned_and_replayable(caplog):
+    caplog.set_level("INFO", logger="mcp-web.agent")
+    draft = _start_string_draft()
+    action_url = _link(draft.text, "Open String Composer (name)")
+    action_id = re.search(r"/agent/action/(A_[^']+)", action_url).group(1)
+    assert action_id in store.actions
+    action = store.actions[action_id]
+    assert action["draft_id"] in store.drafts
+    assert action["view_id"] in store.views
+    assert action["expected_revision"] == store.views[action["view_id"]]["revision"]
+    assert action["expires_at"] == store.views[action["view_id"]]["expires_at"]
+
+    first = client.get(action_url, follow_redirects=False)
+    assert first.status_code == 303 and "/agent/string-view/V_" in first.headers["location"]
+    replay = client.get(action_url, follow_redirects=False)
+    assert replay.status_code == 303
+    assert replay.headers["location"] == first.headers["location"]
+    assert "ACTION_CREATED" in caplog.text and "ACTION_LOOKUP" in caplog.text
+
+
+def test_missing_agent_action_returns_expired_state_instead_of_plain_404():
+    draft = _start_string_draft()
+    action_url = _link(draft.text, "Open String Composer (name)")
+    store.actions.clear()
+    expired = client.get(action_url)
+    assert expired.status_code == 410
+    assert "AGENT STATE EXPIRED" in expired.text
+    assert "Return to Tools" in expired.text
+
+
+def test_view_and_actions_share_rolling_ttl_and_cleanup_together():
+    draft = _start_string_draft()
+    view_id = re.search(r"/agent/view/(V_[^']+)", str(draft.request.url)).group(1)
+    view = store.views[view_id]
+    action_url = _link(draft.text, "Open String Composer (name)")
+    action_id = re.search(r"/agent/action/(A_[^']+)", action_url).group(1)
+    assert store.actions[action_id]["expires_at"] == view["expires_at"]
+    store.drafts[view["draft_id"]]["expires_at"] = "2000-01-01T00:00:00+00:00"
+    assert client.get(f"/agent/view/{view_id}").status_code == 410
+    assert view_id not in store.views and action_id not in store.actions
+
+
+def test_long_link_only_string_workflow_has_no_action_404s():
+    composer = client.get(_link(_start_string_draft().text, "Open String Composer (name)"))
+    statuses = []
+    for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRST":
+        response = client.get(_link(composer.text, f"Append {char}"), follow_redirects=True)
+        statuses.append(response.status_code)
+        composer = response
+    assert len(statuses) >= 80
+    assert all(status == 200 for status in statuses)
+    assert all("AGENT STATE EXPIRED" not in response.text for response in [composer])
+
+
 def test_stale_prepare_action_is_rejected_without_mutating_or_preparing():
     store.catalog.tools = [{"name": "cache_tool", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "class_name": {"type": "string"}}, "required": ["query", "class_name"]}}]
     store.catalog.tool_count = 1
@@ -244,6 +298,7 @@ def test_build_markers_are_visible_on_agent_and_health():
     assert "DEPLOY_COMMIT:" in agent_status.text
     assert "RENDER_INSTANCE_ID:" in agent_status.text
     assert "AGENT_PROTOCOL_VERSION:" in agent_status.text
+    assert "STORE_ID:" in agent_status.text and "PROCESS_ID:" in agent_status.text
     health = client.get("/api/v1/health.json").json()
     assert health["agent_protocol_version"] == "immutable-v1"
 

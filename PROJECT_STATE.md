@@ -73,3 +73,13 @@
 ## HOW TO DEPLOY
 
 Render con Root Directory `web`, Build `pip install -r requirements.txt`, Start `uvicorn app:app --host 0.0.0.0 --port $PORT`.
+
+## AGENT LIFECYCLE
+
+El Agent Gateway conserva actualmente el estado en `MemoryStore`, dentro del proceso web. Cada `ViewSnapshot`, `ActionToken`, editor, Prepared y Result queda ligado a su `draft_id`; las acciones además registran `view_id`, `editor_id` o el snapshot propietario cuando corresponde.
+
+El TTL es rodante de 3600 segundos por draft. Views y acciones comparten el deadline del draft y la limpieza elimina juntos todos sus descendientes, de modo que una acción no puede expirar antes que la View que la publicó. Si un identificador Agent ya no existe, el gateway devuelve `410 AGENT STATE EXPIRED` con enlaces para iniciar una invocación nueva.
+
+Cada creación y lookup de acción registra `action_id`, `draft_id`, `view_id`, revisión esperada, operación, store id, process id e instance id sin incluir argumentos sensibles. Esto permite distinguir token no registrado, estado expirado y aislamiento de proceso.
+
+El despliegue documentado usa un único proceso `uvicorn app:app --host 0.0.0.0 --port $PORT`, sin `gunicorn`, `--workers`, Dockerfile, Procfile, Redis, SQLite ni Render KV. Por tanto, dos procesos distintos no comparten este estado; si Render se configura con workers múltiples o escala horizontalmente, se requiere un backend compartido antes de declarar soporte cross-worker.

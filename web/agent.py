@@ -4,6 +4,8 @@ import json
 import asyncio
 import copy
 import hashlib
+import logging
+import os
 import time
 from datetime import datetime, timezone
 from html import escape
@@ -24,6 +26,9 @@ except ImportError:  # Render runs `uvicorn app:app` from web/
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+logger = logging.getLogger("mcp-web.agent")
 
 
 def schema_type(schema: dict[str, Any]) -> str:
@@ -142,11 +147,68 @@ def agent_redirect(path: str, status_code: int = 303) -> RedirectResponse:
 def register_agent_routes(app, store, current_studio_connected):
     DRAFT_TTL_SECONDS = 3600
 
+    def lifecycle_context() -> dict[str, str]:
+        return {
+            "store_id": str(getattr(store, "server_instance_id", "unknown")),
+            "process_id": str(os.getpid()),
+            "instance_id": str(RENDER_INSTANCE_ID),
+        }
+
+    def register_action(action: dict[str, Any]) -> None:
+        draft = store.drafts.get(action.get("draft_id"))
+        if draft and not action.get("expires_at"):
+            action["expires_at"] = draft.get("expires_at")
+        lock = getattr(store, "lock", None)
+        if lock is None:
+            store.actions[action["action_id"]] = action
+        else:
+            with lock:
+                store.actions[action["action_id"]] = action
+        context = lifecycle_context()
+        logger.info(
+            "ACTION_CREATED action_id=%s draft_id=%s view_id=%s expected_revision=%s operation=%s created_at=%s store_id=%s process_id=%s instance_id=%s",
+            action["action_id"], action.get("draft_id"), action.get("view_id"),
+            action.get("expected_revision"), action.get("operation"), action.get("created_at"),
+            context["store_id"], context["process_id"], context["instance_id"],
+        )
+
+    def expired_state(kind: str, state_id: str, detail: str = "") -> HTMLResponse:
+        context = lifecycle_context()
+        logger.warning(
+            "AGENT_STATE_EXPIRED kind=%s state_id=%s store_id=%s process_id=%s instance_id=%s action_count=%s drafts=%s views=%s detail=%s",
+            kind, state_id, context["store_id"], context["process_id"], context["instance_id"],
+            len(store.actions), len(store.drafts), len(store.views),
+            detail or "none",
+        )
+        body = (
+            "<h1>AGENT STATE EXPIRED</h1>"
+            f"<p>{escape(kind.capitalize())} no longer available. Return to Tools and start a fresh invocation.</p>"
+            f"<p>state_id: <code>{escape(state_id)}</code></p>"
+            f"<p>store_id: <code>{escape(context['store_id'])}</code></p>"
+            f"<p>process_id: <code>{escape(context['process_id'])}</code></p>"
+            f"<p>{href('/agent/tools', 'Return to Tools')} {href('/agent', 'Agent Home')}</p>"
+        )
+        response = agent_page("Agent State Expired", body)
+        response.status_code = 410
+        return response
+
+    def missing_action(action_id: str) -> HTMLResponse:
+        context = lifecycle_context()
+        logger.warning(
+            "ACTION_LOOKUP action_id=%s exists=no store_id=%s process_id=%s instance_id=%s action_count=%s drafts=%s views=%s draft_exists=no view_exists=no",
+            action_id, context["store_id"], context["process_id"], context["instance_id"],
+            len(store.actions), len(store.drafts), len(store.views),
+        )
+        return expired_state("action", action_id, "missing")
+
     def purge_drafts() -> None:
-        cutoff = time.time() - DRAFT_TTL_SECONDS
+        now_epoch = time.time()
+        cutoff = now_epoch - DRAFT_TTL_SECONDS
         for draft_id, draft in list(store.drafts.items()):
             try:
-                if datetime.fromisoformat(draft.get("last_access", draft["created_at"])).timestamp() < cutoff:
+                deadline = draft.get("expires_at")
+                expires_epoch = datetime.fromisoformat(deadline).timestamp() if deadline else datetime.fromisoformat(draft.get("last_access", draft["created_at"])).timestamp() + DRAFT_TTL_SECONDS
+                if expires_epoch < now_epoch or expires_epoch < cutoff:
                     del store.drafts[draft_id]
                     for collection in (store.views, store.actions, store.prepared, store.result_views, store.editors):
                         for item_id, item in list(collection.items()):
@@ -169,7 +231,25 @@ def register_agent_routes(app, store, current_studio_connected):
         draft = store.drafts.get(draft_id)
         if not draft:
             raise HTTPException(404, "Draft not found or expired")
+        refresh_deadline(draft)
         return draft
+
+    def touch_view(view: dict[str, Any]) -> None:
+        draft = store.drafts.get(view.get("draft_id"))
+        if draft:
+            refresh_deadline(draft)
+            view["last_access"] = draft["last_access"]
+            view["expires_at"] = draft["expires_at"]
+
+    def refresh_deadline(draft: dict[str, Any]) -> None:
+        touched = datetime.now(timezone.utc)
+        draft["last_access"] = touched.isoformat()
+        draft["expires_at"] = (touched.timestamp() + DRAFT_TTL_SECONDS)
+        draft["expires_at"] = datetime.fromtimestamp(draft["expires_at"], timezone.utc).isoformat()
+        for collection in (store.views, store.actions, store.prepared, store.result_views, store.editors):
+            for item in collection.values():
+                if item.get("draft_id") == draft.get("draft_id"):
+                    item["expires_at"] = draft["expires_at"]
 
     def required(schema: dict[str, Any]) -> list[str]:
         return list(schema.get("required", []))
@@ -179,16 +259,19 @@ def register_agent_routes(app, store, current_studio_connected):
 
     def bump(draft: dict[str, Any]) -> None:
         draft["revision"] = int(draft.get("revision", 0)) + 1
-        draft["last_access"] = now()
+        refresh_deadline(draft)
 
     def create_agent_view(draft: dict[str, Any]) -> str:
         view_id = "V_" + uuid4().hex[:18]
         arguments = copy.deepcopy(draft.get("arguments", {}))
+        created_at = now()
         snapshot = {
             "view_id": view_id,
             "draft_id": draft["draft_id"],
             "revision": int(draft.get("revision", 0)),
-            "created_at": now(),
+            "created_at": created_at,
+            "last_access": created_at,
+            "expires_at": draft.get("expires_at"),
             "arguments_snapshot": arguments,
             "missing_arguments": [name for name in required(draft["schema"]) if name not in arguments],
             "ready": not any(name for name in required(draft["schema"]) if name not in arguments),
@@ -203,16 +286,17 @@ def register_agent_routes(app, store, current_studio_connected):
 
     def make_action(draft_id: str, expected_revision: int, operation: str, payload: dict[str, Any]) -> str:
         action_id = "A_" + uuid4().hex[:18]
-        store.actions[action_id] = {
+        register_action({
             "action_id": action_id,
             "draft_id": draft_id,
             "expected_revision": expected_revision,
             "operation": operation,
             "payload": copy.deepcopy(payload),
             "created_at": now(),
+            "expires_at": store.drafts.get(draft_id, {}).get("expires_at"),
             "consumed": False,
             "resulting_view_id": None,
-        }
+        })
         return f"/agent/action/{action_id}"
 
     def action_link(draft_id: str, revision: int, operation: str, payload: dict[str, Any], label: str) -> str:
@@ -223,7 +307,7 @@ def register_agent_routes(app, store, current_studio_connected):
         action_id = view.setdefault("action_ids", {}).get(key)
         if not action_id:
             action_id = "A_" + uuid4().hex[:18]
-            store.actions[action_id] = {"action_id": action_id, "draft_id": view["draft_id"], "expected_revision": view["revision"], "operation": operation, "payload": copy.deepcopy(payload), "created_at": now(), "consumed": False, "resulting_url": None}
+            register_action({"action_id": action_id, "draft_id": view["draft_id"], "view_id": view["view_id"], "expected_revision": view["revision"], "operation": operation, "payload": copy.deepcopy(payload), "created_at": now(), "consumed": False, "resulting_url": None})
             view["action_ids"][key] = action_id
         return href(f"/agent/action/{action_id}", label)
 
@@ -318,7 +402,7 @@ def register_agent_routes(app, store, current_studio_connected):
         action_id = editor["action_ids"].get(key)
         if not action_id:
             action_id = "A_" + uuid4().hex[:18]
-            store.actions[action_id] = {"action_id": action_id, "draft_id": editor["draft_id"], "expected_revision": editor["revision"], "operation": operation, "payload": {"editor_id": editor["editor_id"], **copy.deepcopy(payload)}, "created_at": now(), "consumed": False, "resulting_url": None}
+            register_action({"action_id": action_id, "draft_id": editor["draft_id"], "view_id": editor.get("view_id"), "editor_id": editor["editor_id"], "expected_revision": editor["revision"], "operation": operation, "payload": {"editor_id": editor["editor_id"], **copy.deepcopy(payload)}, "created_at": now(), "consumed": False, "resulting_url": None})
             editor["action_ids"][key] = action_id
         return href(f"/agent/action/{action_id}", label)
 
@@ -683,8 +767,9 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/status", response_class=HTMLResponse)
     async def agent_status():
+        context = lifecycle_context()
         heartbeat = store.heartbeat.model_dump(mode="json") if store.heartbeat else {}
-        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
+        body = f"<h1>Agent Status</h1><p>local_client_online: {str(store.online()).lower()}</p><p>mcp_connected: {str(bool(heartbeat.get('mcp_connected') and store.online())).lower()}</p><p>studio_connected: {str(current_studio_connected()).lower()}</p><p>tool_count: {store.catalog.tool_count}</p><p>STORE_ID: <code>{escape(context['store_id'])}</code></p><p>PROCESS_ID: <code>{escape(context['process_id'])}</code></p><p>DEPLOY_COMMIT: <code>{escape(DEPLOY_COMMIT)}</code></p><p>RENDER_INSTANCE_ID: <code>{escape(RENDER_INSTANCE_ID)}</code></p><p>AGENT_PROTOCOL_VERSION: <code>{escape(AGENT_PROTOCOL_VERSION)}</code></p><p>{href('/agent', 'Agent Home')} {href('/read/health', 'Live Health')}</p>"
         return agent_page("Agent Status", body)
 
     @app.get("/agent/tools", response_class=HTMLResponse)
@@ -703,17 +788,22 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/tool/{tool_name}/start")
     async def agent_start(tool_name: str):
+        purge_drafts()
         tool = tool_or_404(tool_name)
         draft_id = "d_" + uuid4().hex[:16]
-        store.drafts[draft_id] = {"draft_id": draft_id, "revision": 0, "tool_name": tool_name, "schema": tool.get("inputSchema", {}), "arguments": {}, "created_at": now(), "last_access": now(), "status": "draft", "executed": False, "request_id": None, "execution_token": None}
+        created_at = datetime.now(timezone.utc)
+        expires_at = (created_at.timestamp() + DRAFT_TTL_SECONDS)
+        store.drafts[draft_id] = {"draft_id": draft_id, "revision": 0, "tool_name": tool_name, "schema": tool.get("inputSchema", {}), "arguments": {}, "created_at": created_at.isoformat(), "last_access": created_at.isoformat(), "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(), "status": "draft", "executed": False, "request_id": None, "execution_token": None}
         view_id = create_agent_view(store.drafts[draft_id])
         return agent_redirect(f"/agent/view/{view_id}")
 
     @app.get("/agent/view/{view_id}", response_class=HTMLResponse)
     async def agent_view(view_id: str):
+        purge_drafts()
         view = store.views.get(view_id)
         if not view:
-            raise HTTPException(404, "View not found or expired")
+            return expired_state("view", view_id, "missing")
+        touch_view(view)
         draft = draft_or_404(view["draft_id"])
         fields = []
         for name, schema in view["schema"].get("properties", {}).items():
@@ -725,13 +815,27 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/action/{action_id}", response_class=HTMLResponse)
     async def agent_action(action_id: str):
+        purge_drafts()
         action = store.actions.get(action_id)
         if not action:
-            raise HTTPException(404, "Action not found or expired")
+            return missing_action(action_id)
+        context = lifecycle_context()
+        logger.info(
+            "ACTION_LOOKUP action_id=%s exists=yes store_id=%s process_id=%s instance_id=%s action_count=%s draft_id=%s view_id=%s draft_exists=%s view_exists=%s expected_revision=%s consumed=%s",
+            action_id, context["store_id"], context["process_id"], context["instance_id"],
+            len(store.actions), action.get("draft_id"), action.get("view_id"),
+            action.get("draft_id") in store.drafts, action.get("view_id") in store.views,
+            action.get("expected_revision"), action.get("consumed"),
+        )
         if action.get("consumed"):
             target = action.get("resulting_url")
             return agent_redirect(target) if target else agent_page("Action complete", "<h1>Action already consumed</h1>")
-        draft = draft_or_404(action["draft_id"])
+        try:
+            draft = draft_or_404(action["draft_id"])
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return expired_state("draft", str(action.get("draft_id")), "action owner missing")
+            raise
         if action["operation"] not in {"execute_prepared", "refresh_result"} and int(action["expected_revision"]) != int(draft.get("revision", 0)):
             return stale_page(action, draft)
         operation = action["operation"]; payload = action["payload"]
@@ -744,7 +848,7 @@ def register_agent_routes(app, store, current_studio_connected):
         elif operation == "open_editor":
             source_view = store.views.get(payload.get("view_id"))
             if not source_view:
-                raise HTTPException(404, "Source view not found")
+                return expired_state("view", str(payload.get("view_id")), "action source missing")
             editor_path = list(payload["path"])
             editor_schema = payload.get("schema")
             property_schemas = {}
@@ -758,13 +862,13 @@ def register_agent_routes(app, store, current_studio_connected):
         elif operation == "editor_open_key":
             editor = store.editors.get(payload.get("editor_id"))
             if not editor:
-                raise HTTPException(404, "Editor not found")
+                return expired_state("editor", str(payload.get("editor_id")), "action editor missing")
             source_view = store.views.get(editor["view_id"])
             target = create_key_editor(source_view, editor["path"], payload.get("parent_schema") or editor.get("schema"), editor.get("property_schemas"))
         elif operation in {"editor_append_key", "editor_backspace_key", "editor_clear_key"}:
             editor = store.editors.get(payload.get("editor_id"))
             if not editor:
-                raise HTTPException(404, "Editor not found")
+                return expired_state("editor", str(payload.get("editor_id")), "action editor missing")
             value = str(editor["value_snapshot"])
             if operation == "editor_append_key": value += payload["character"]
             elif operation == "editor_backspace_key": value = value[:-1]
@@ -776,7 +880,7 @@ def register_agent_routes(app, store, current_studio_connected):
         elif operation == "editor_finish_key":
             editor = store.editors.get(payload.get("editor_id"))
             if not editor:
-                raise HTTPException(404, "Editor not found")
+                return expired_state("editor", str(payload.get("editor_id")), "action editor missing")
             key = str(editor["value_snapshot"])
             if not key:
                 target = create_editor(store.views[editor["view_id"]], editor["path"], "object", editor.get("parent_schema"), editor.get("property_schemas"))
@@ -880,7 +984,7 @@ def register_agent_routes(app, store, current_studio_connected):
         elif operation == "execute_prepared":
             prepared = store.prepared.get(payload["prepare_id"])
             if not prepared:
-                raise HTTPException(404, "Prepared invocation not found")
+                return expired_state("prepared", str(payload["prepare_id"]), "action prepared missing")
             if prepared.get("executed"):
                 target = f"/agent/result-view/{prepared['result_view_id']}"
             else:
@@ -894,7 +998,7 @@ def register_agent_routes(app, store, current_studio_connected):
         elif operation == "refresh_result":
             old = store.result_views.get(payload["result_view_id"])
             if not old:
-                raise HTTPException(404, "Result view not found")
+                return expired_state("result view", str(payload["result_view_id"]), "action result missing")
             job = store.jobs.get(old["request_id"])
             status = job.status if job else old["status"]
             result_view_id = "R_" + uuid4().hex[:18]
@@ -928,9 +1032,11 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/string-view/{view_id}/{name}", response_class=HTMLResponse)
     async def string_view(view_id: str, name: str):
+        purge_drafts()
         view = store.views.get(view_id)
         if not view or name not in view["schema"].get("properties", {}):
-            raise HTTPException(404, "String view not found")
+            return expired_state("string view", view_id, "missing")
+        touch_view(view)
         current = str(view["arguments_snapshot"].get(name, "")); base = f"/agent/string-view/{view_id}/{quote(name, safe='')}"
         links = " ".join(view_action_link(view, "append_string", {"name": name, "character": char}, f"Append {char if char != ' ' else 'space'}") for token, char in STRING_CHARACTERS)
         actions = " ".join([view_action_link(view, "backspace", {"name": name}, "Backspace"), view_action_link(view, "clear", {"name": name}, "Clear"), view_action_link(view, "finish_string", {"name": name}, "Finish"), href(f"/agent/view/{view_id}", "Back to Draft")])
@@ -939,9 +1045,11 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/picker-view/{view_id}/{name}", response_class=HTMLResponse)
     async def picker_view(view_id: str, name: str):
+        purge_drafts()
         view = store.views.get(view_id)
         if not view:
-            raise HTTPException(404, "Picker view not found")
+            return expired_state("picker", view_id, "missing")
+        touch_view(view)
         items = []
         for candidate in view.get("recent_refs", [])[-50:]:
             candidate_url = view_action_link(view, "select_instance", {"name": name, "candidate": candidate}, "__candidate__")
@@ -953,19 +1061,27 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/editor/{editor_id}", response_class=HTMLResponse)
     async def editor_view(editor_id: str):
+        purge_drafts()
         editor = store.editors.get(editor_id)
         if not editor:
-            raise HTTPException(404, "Editor not found or expired")
+            return expired_state("editor", editor_id, "missing")
+        view = store.views.get(editor.get("view_id"))
+        if view:
+            touch_view(view)
         return render_editor(editor)
 
     @app.get("/agent/prepared/{prepare_id}", response_class=HTMLResponse)
     async def prepared_view(prepare_id: str):
+        purge_drafts()
         prepared = store.prepared.get(prepare_id)
         if not prepared:
-            raise HTTPException(404, "Prepared invocation not found or expired")
+            return expired_state("prepared", prepare_id, "missing")
+        draft = store.drafts.get(prepared.get("draft_id"))
+        if draft:
+            draft["last_access"] = now()
         if not prepared.get("execute_action_id"):
             action_id = "A_" + uuid4().hex[:18]
-            store.actions[action_id] = {"action_id": action_id, "draft_id": prepared["draft_id"], "expected_revision": prepared["draft_revision"], "operation": "execute_prepared", "payload": {"prepare_id": prepare_id}, "created_at": now(), "consumed": False, "resulting_url": None}
+            register_action({"action_id": action_id, "draft_id": prepared["draft_id"], "prepared_id": prepare_id, "expected_revision": prepared["draft_revision"], "operation": "execute_prepared", "payload": {"prepare_id": prepare_id}, "created_at": now(), "consumed": False, "resulting_url": None})
             prepared["execute_action_id"] = action_id
         execute_href = href(f"/agent/action/{prepared['execute_action_id']}", "Execute now") if not prepared.get("executed") else href(f"/agent/result-view/{prepared['result_view_id']}", "Open Result")
         body = f"<h1>Prepared Invocation</h1><p>PREPARE_ID: <code>{escape(prepare_id)}</code></p><p>DRAFT_ID: <code>{escape(prepared['draft_id'])}</code></p><p>DRAFT_REVISION: {prepared['draft_revision']}</p><p>STATE: {escape('executed' if prepared.get('executed') else 'prepared')}</p><p>TOOL: {escape(prepared['tool_name'])}</p><p>ARGUMENTS_SHA256: <code>{prepared['arguments_hash']}</code></p><pre>{escape(json.dumps(prepared['arguments_snapshot'], ensure_ascii=False, indent=2))}</pre><p>{execute_href} {href('/agent', 'Agent Home')}</p>"
@@ -973,14 +1089,18 @@ def register_agent_routes(app, store, current_studio_connected):
 
     @app.get("/agent/result-view/{result_view_id}", response_class=HTMLResponse)
     async def result_view(result_view_id: str):
+        purge_drafts()
         snapshot = store.result_views.get(result_view_id)
         if not snapshot:
-            raise HTTPException(404, "Result view not found or expired")
+            return expired_state("result view", result_view_id, "missing")
+        draft = store.drafts.get(snapshot.get("draft_id"))
+        if draft:
+            draft["last_access"] = now()
         if snapshot["status"] in {"pending", "running"}:
             action_id = snapshot.get("refresh_action_id")
             if not action_id:
                 action_id = "A_" + uuid4().hex[:18]
-                store.actions[action_id] = {"action_id": action_id, "draft_id": snapshot["draft_id"], "expected_revision": snapshot["draft_revision"], "operation": "refresh_result", "payload": {"result_view_id": result_view_id}, "created_at": now(), "consumed": False, "resulting_url": None}
+                register_action({"action_id": action_id, "draft_id": snapshot["draft_id"], "result_view_id": result_view_id, "expected_revision": snapshot["draft_revision"], "operation": "refresh_result", "payload": {"result_view_id": result_view_id}, "created_at": now(), "consumed": False, "resulting_url": None})
                 snapshot["refresh_action_id"] = action_id
             refresh = href(f"/agent/action/{action_id}", "Refresh Result")
         else:
