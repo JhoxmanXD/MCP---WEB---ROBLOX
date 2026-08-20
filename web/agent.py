@@ -643,13 +643,18 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
         store.create_job(Job(request_id=request_id, tool=tool_name, arguments=arguments))
         deadline = asyncio.get_running_loop().time() + DISCOVERY_WAIT_SECONDS
         while asyncio.get_running_loop().time() < deadline:
-            job = store.jobs[request_id]
+            job = store.jobs.get(request_id)
+            if job is None:
+                return {"request_id": request_id, "tool": tool_name, "status": "error", "error": {"message": "discovery job state was refreshed before completion"}}
             if job.status in {"completed", "error"}:
                 if job.status == "completed":
                     collect_refs(job.result)
                 return job.model_dump(mode="json")
             await asyncio.sleep(0.25)
-        return store.jobs[request_id].model_dump(mode="json")
+        job = store.jobs.get(request_id)
+        if job is None:
+            return {"request_id": request_id, "tool": tool_name, "status": "error", "error": {"message": "discovery job state was refreshed before timeout"}}
+        return job.model_dump(mode="json")
 
     def result_data(result: Any) -> Any:
         if not isinstance(result, dict):
@@ -738,6 +743,38 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
             known = known_property_schema(context.get("class_name"), name)
             if known:
                 known_fallbacks[name] = known
+
+        # A relay job may complete after the request that created it has
+        # returned.  Reuse the newest completed runtime result for the exact
+        # class/property contract before issuing another delayed discovery.
+        # This is a server-side result cache, not editor/session reuse, and it
+        # preserves only complete EnumItem metadata.
+        if missing_names and context.get("class_name"):
+            matching_jobs = []
+            requested_names = [str(name) for name in missing_names]
+            for job in store.jobs.values():
+                if job.status != "completed" or job.tool != "studio_get_properties":
+                    continue
+                job_arguments = job.arguments if isinstance(job.arguments, dict) else {}
+                job_names = job_arguments.get("names")
+                if job_arguments.get("class_name") != context["class_name"] or job_names != requested_names:
+                    continue
+                matching_jobs.append(job)
+            for job in reversed(matching_jobs):
+                data = result_data(job.result)
+                metadata = data.get("propertyMetadata") or data.get("property_metadata") if isinstance(data, dict) else {}
+                if not isinstance(metadata, dict):
+                    continue
+                for name in list(missing_names):
+                    if name not in metadata:
+                        continue
+                    merged = merge_property_metadata(cache.get(name), metadata[name])
+                    if enum_metadata_incomplete(merged):
+                        continue
+                    cache[name] = merged
+                missing_names = [name for name in missing_names if name not in cache or enum_metadata_incomplete(cache.get(name))]
+                if not missing_names:
+                    break
         if missing_names and (context.get("ref") is not None or context.get("class_name")):
             tool_name = "studio_get_properties" if "studio_get_properties" in catalog_tools() else "properties"
             request: dict[str, Any] = {"names": missing_names}
@@ -800,10 +837,9 @@ def register_agent_routes(app, store, current_studio_connected, agent_state_stat
                         break
         # Use only audited contracts as a deterministic offline fallback.  A
         # live bridge response above always wins and supplies enum members.
-        if not live_discovery_attempted:
-            for name, known in known_fallbacks.items():
-                if name not in cache:
-                    cache[name] = copy.deepcopy(known)
+        for name, known in known_fallbacks.items():
+            if name not in cache and not (live_discovery_attempted and enum_metadata_incomplete(known)):
+                cache[name] = copy.deepcopy(known)
         result: dict[str, dict[str, Any]] = {}
         for name in names:
             metadata = cache.get(name)

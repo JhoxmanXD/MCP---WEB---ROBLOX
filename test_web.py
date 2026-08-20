@@ -946,6 +946,48 @@ def test_incomplete_enum_metadata_does_not_overwrite_complete_runtime_values():
     assert merged["enumValues"] == complete["enumValues"]
 
 
+def test_completed_runtime_metadata_is_reused_by_a_fresh_editor():
+    runtime_metadata = {
+        "Material": {
+            "robloxType": "EnumItem",
+            "enumType": "Material",
+            "enumValues": [
+                {"value": 256, "enumType": "Material", "name": "Plastic", "$type": "EnumItem"},
+                {"value": 1280, "enumType": "Material", "name": "Grass", "$type": "EnumItem"},
+            ],
+        }
+    }
+    from web.models import Job
+
+    completed = store.create_job(Job(
+        request_id="WEB_AGENT_DISCOVER_COMPLETED_MATERIAL",
+        tool="studio_get_properties",
+        arguments={"names": ["Material"], "class_name": "Part"},
+    ))
+    store.complete(completed.request_id, True, {"structuredContent": {"ok": True, "data": {"propertyMetadata": runtime_metadata}}})
+    store.catalog.tools = [
+        {"name": "studio_create_instance", "inputSchema": {"type": "object", "properties": {
+            "class_name": {"type": "string"}, "properties": {"type": "object", "additionalProperties": True},
+        }}},
+        {"name": "studio_get_properties", "inputSchema": {"type": "object", "properties": {"class_name": {"type": "string"}}}},
+    ]
+    store.catalog.tool_count = 2
+
+    tool_page = client.get("/agent/tool/studio_create_instance")
+    started = client.get(_link(tool_page.text, "Start invocation"), follow_redirects=False)
+    view = client.get(started.headers["location"])
+    view = client.get(_links(view.text, "Set Part")[0], follow_redirects=True)
+    editor = client.get(_links(view.text, "Edit object")[0], follow_redirects=True)
+    key = client.get(_link(editor.text, "Add field"))
+    for char in "Material":
+        key = client.get(_link(key.text, f"Append {char}"), follow_redirects=True)
+    editor = client.get(_link(key.text, "Finish"), follow_redirects=True)
+    enum_page = client.get(_link(editor.text, "Edit Material"))
+
+    assert enum_page.status_code == 200
+    assert "Set Plastic" in enum_page.text and "Set Grass" in enum_page.text
+
+
 def test_enum_metadata_recovers_after_first_discovery_timeout(monkeypatch):
     from web import agent as agent_module
 
