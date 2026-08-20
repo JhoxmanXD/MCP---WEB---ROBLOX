@@ -407,6 +407,11 @@ class SharedAgentStateStore(AgentStateStore):
         self._last_error: str | None = None
         self._configured = bool(url)
         self._roundtrip: bool | None = None
+        # Redis provides cross-process exclusion.  This local FIFO gate keeps
+        # requests from the same Render worker from repeatedly overtaking a
+        # waiter while Redis round-trips are slow.
+        self._process_lock = asyncio.Lock()
+        self._process_owner = "none"
 
     def status(self) -> dict[str, Any]:
         identity_hash, database = self._backend_identity()
@@ -518,14 +523,35 @@ class SharedAgentStateStore(AgentStateStore):
         token = uuid4().hex
         started = time.monotonic()
         _lock_log(logging.WARNING, "AGENT_LOCK_WAIT", context, reason=reason)
-        deadline = time.monotonic() + float(os.getenv("AGENT_STATE_LOCK_WAIT_SECONDS", "5"))
-        while time.monotonic() < deadline:
-            if await redis.set(self.lock_key, token, nx=True, ex=self.lock_seconds):
-                wait_ms = int((time.monotonic() - started) * 1000)
-                _lock_log(logging.WARNING, "AGENT_LOCK_ACQUIRED", context, wait_ms=wait_ms, reason=reason)
-                return token, wait_ms
-            await asyncio.sleep(0.1)
-        raise AgentStateBackendUnavailable("timed out acquiring shared Agent state lock")
+        process_gate_acquired = False
+        lease_acquired = False
+        try:
+            await self._process_lock.acquire()
+            process_gate_acquired = True
+            deadline = time.monotonic() + float(os.getenv("AGENT_STATE_LOCK_WAIT_SECONDS", "5"))
+            while time.monotonic() < deadline:
+                if await redis.set(self.lock_key, token, nx=True, ex=self.lock_seconds):
+                    wait_ms = int((time.monotonic() - started) * 1000)
+                    self._process_owner = f"{context['action_id']}/{context['operation']}/process-{context['process']}"
+                    lease_acquired = True
+                    _lock_log(logging.WARNING, "AGENT_LOCK_ACQUIRED", context, wait_ms=wait_ms, reason=reason)
+                    return token, wait_ms
+                await asyncio.sleep(0.1)
+            lock_ttl = "unknown"
+            try:
+                lock_ttl = str(await redis.ttl(self.lock_key))
+            except Exception:
+                pass
+            wait_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "AGENT_LOCK_TIMEOUT request_id=%s action_id=%s operation=%s process=%s instance=%s wait_ms=%s held_ms=0 reason=%s local_owner=%s redis_lock_ttl=%s",
+                context["request_id"], context["action_id"], context["operation"], context["process"], context["instance"],
+                wait_ms, reason, self._process_owner, lock_ttl,
+            )
+            raise AgentStateBackendUnavailable("timed out acquiring shared Agent state lock")
+        finally:
+            if process_gate_acquired and not lease_acquired:
+                self._process_lock.release()
 
     async def _release(self, redis: Any, token: str) -> None:
         script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
@@ -534,6 +560,10 @@ class SharedAgentStateStore(AgentStateStore):
         except Exception:
             # The lease expires automatically; never mask the route result.
             pass
+        finally:
+            if self._process_lock.locked():
+                self._process_owner = "none"
+                self._process_lock.release()
 
     async def _load(self, redis: Any, store: Any) -> int:
         raw = await redis.get(self.key)

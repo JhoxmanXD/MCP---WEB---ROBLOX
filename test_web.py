@@ -435,6 +435,30 @@ def test_shared_lock_is_released_during_external_discovery(caplog):
     assert "reason=slow_discovery" in caplog.text
 
 
+def test_redis_lock_timeout_releases_local_gate_and_reports_contention(monkeypatch, caplog):
+    backend = RedisAgentStateBackend("redis://forensic", "test:lock-timeout", 3600, 60)
+    redis = _ForensicRedis()
+    backend._redis = redis
+    redis.values[backend.lock_key] = "foreign-owner"
+    redis.expiries[backend.lock_key] = time.monotonic() + 60
+    monkeypatch.setenv("AGENT_STATE_LOCK_WAIT_SECONDS", "0.01")
+    caplog.set_level("WARNING", logger="mcp-web.agent_state")
+
+    async def scenario():
+        with pytest.raises(AgentStateBackendUnavailable, match="timed out acquiring shared Agent state lock"):
+            async with backend.request(MemoryStore(), {"action_id": "A_timeout", "operation": "editor_append_key"}):
+                pass
+        # A failed acquisition must not leave the per-process gate locked.
+        await redis.delete(backend.lock_key)
+        async with backend.request(MemoryStore(), {"action_id": "A_after_timeout", "operation": "editor_append_key"}):
+            pass
+
+    asyncio.run(scenario())
+    assert "AGENT_LOCK_TIMEOUT" in caplog.text
+    assert "action_id=A_timeout" in caplog.text
+    assert "local_owner=none" in caplog.text
+
+
 def test_pending_discovery_survives_client_disconnect_for_single_action_replay():
     from web.models import Job
 
@@ -763,11 +787,11 @@ def test_view_and_actions_share_rolling_ttl_and_cleanup_together():
 def test_long_link_only_string_workflow_has_no_action_404s():
     composer = client.get(_link(_start_string_draft().text, "Open String Composer (name)"))
     statuses = []
-    for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRST":
+    for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ":
         response = client.get(_link(composer.text, f"Append {char}"), follow_redirects=True)
         statuses.append(response.status_code)
         composer = response
-    assert len(statuses) >= 80
+    assert len(statuses) >= 100
     assert all(status == 200 for status in statuses)
     assert all("AGENT STATE EXPIRED" not in response.text for response in [composer])
 
